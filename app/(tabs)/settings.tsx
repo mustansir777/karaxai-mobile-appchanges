@@ -37,7 +37,7 @@ export default function SettingsScreen() {
           <FontAwesome name="chevron-right" size={16} color="#BBBBBB" />
         </TouchableOpacity>
         
-        <TouchableOpacity style={styles.settingItem}>
+        {/* <TouchableOpacity style={styles.settingItem}>
           <View style={styles.iconContainer}>
             <FontAwesome name="bell" size={18} color="#BBBBBB" />
           </View>
@@ -45,7 +45,7 @@ export default function SettingsScreen() {
             <Text style={styles.settingLabel}>Notifications</Text>
           </View>
           <FontAwesome name="chevron-right" size={16} color="#BBBBBB" />
-        </TouchableOpacity>
+        </TouchableOpacity> */}
         
         {/* <TouchableOpacity style={styles.settingItem}>
           <View style={styles.iconContainer}>
