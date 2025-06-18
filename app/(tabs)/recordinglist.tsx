@@ -7,16 +7,15 @@ import useAuthStorage from "@/hooks/useAuthData";
 import { useSyncMeetingToDB } from "@/hooks/useSyncMeetingToDB";
 import getGreetingBasedOnTime from "@/utils/getGreeting";
 import getTodayDate from "@/utils/getTodayDate";
-import { AntDesign, Ionicons, MaterialIcons, Feather } from "@expo/vector-icons";
+import { AntDesign, Ionicons, MaterialIcons, Feather, Entypo } from "@expo/vector-icons";
 import { useIsFocused } from "@react-navigation/native";
 import { useSQLiteContext } from "expo-sqlite";
-import { useEffect, useState } from "react";
-import { View, Text, FlatList, ActivityIndicator, TouchableOpacity, ScrollView, StyleSheet, Dimensions, TextInput } from "react-native";
+import { useEffect, useState, useRef } from "react";
+import { View, Text, FlatList, ActivityIndicator, TouchableOpacity, ScrollView, StyleSheet, Dimensions, TextInput, Alert, Modal, RefreshControl } from "react-native";
 import { axiosApi, CategoryWithMeetings, MeetingWithBot } from "@/api/api";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import { router } from "expo-router";
 import { Toast } from "@/utils/toast";
-import { FeatureSliderDialog } from "@/components/modal/FeatureSliderDialog";
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { parseISO, format, isToday, isYesterday, isThisWeek, isThisMonth } from "date-fns";
@@ -85,14 +84,14 @@ interface GroupedMeeting {
   meetings: Meeting[];
 }
 
-export default function RecordingListScreen() {
+export default function RecordingList() {
   const todayDate = getTodayDate();
   const db = useSQLiteContext();
   const [meetingUrl, setMeetingUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
   const [viewAllMode, setViewAllMode] = useState(false);
-  const [showFeatureDialog, setShowFeatureDialog] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const isFocused = useIsFocused();
   const { userId, username } = useAuthStorage(); // username is defined here
   const { isSyncInProgress, syncMeetingToDB } = useSyncMeetingToDB();
@@ -101,26 +100,130 @@ export default function RecordingListScreen() {
   // State for categories and expansion
   const [categories, setCategories] = useState<CategoryWithMeetings[]>([]);
   const [allMeetings, setAllMeetings] = useState<Meeting[]>([]);
+  const [selectedMeeting, setSelectedMeeting] = useState<Meeting | null>(null);
+  const [menuVisible, setMenuVisible] = useState(false);
+  const [menuPosition, setMenuPosition] = useState({ x: 0, y: 0 });
+  const [renameDialogVisible, setRenameDialogVisible] = useState(false);
+  const [newMeetingName, setNewMeetingName] = useState("");
 
-  // Check if feature dialog should be shown
-  useEffect(() => {
-    const checkFeatureDialogPreference = async () => {
-      try {
-        const dontShowAgain = await AsyncStorage.getItem('dontShowFeatureSlider');
-        if (dontShowAgain !== 'true') {
-          setShowFeatureDialog(true);
-        }
-      } catch (error) {
-        console.error('Error checking feature dialog preference:', error);
-        // If there's an error reading from storage, show the dialog anyway
-        setShowFeatureDialog(true);
-      }
-    };
+  // Delete meeting mutation
+  const deleteMeetingMutation = useMutation({
+    mutationKey: ['deleteMeeting'],
+    mutationFn: async (eventId: string) => {
+      return axiosApi({
+        url: `/delete-meeting/${eventId}/` as any,
+        method: 'DELETE',
+      }).then((res) => res.data);
+    },
+    onSuccess: () => {
+      Toast.show('Meeting deleted successfully', Toast.SHORT, 'top');
+      queryClient.invalidateQueries({ queryKey: ['categoriesWithMeetings'] });
+      queryClient.invalidateQueries({ queryKey: ['uncategorizedMeetings'] });
+    },
+    onError: (error: any) => {
+      console.error('Error deleting meeting:', error);
+      Toast.show(
+        error.message || 'Failed to delete meeting',
+        Toast.SHORT,
+        'top',
+        'error'
+      );
+    },
+  });
 
-    if (isFocused) {
-      checkFeatureDialogPreference();
+  // Rename meeting mutation
+  const renameMeetingMutation = useMutation({
+    mutationKey: ['renameMeeting'],
+    mutationFn: async ({ eventId, meetingName }: { eventId: string, meetingName: string }) => {
+      return axiosApi({
+        url: `/rename-meeting/${eventId}/` as any,
+        method: 'POST',
+        data: {
+          meeting_name: meetingName,
+        },
+      }).then((res) => res.data);
+    },
+    onSuccess: () => {
+      Toast.show('Meeting renamed successfully', Toast.SHORT, 'top');
+      // Refresh the meetings list
+      refetch();
+      // Close the rename dialog
+      setRenameDialogVisible(false);
+      // Ensure viewAllMode is preserved
+      setViewAllMode(true);
+    },
+    onError: (error: any) => {
+      Toast.show(
+        error.message || 'Failed to rename meeting',
+        Toast.SHORT,
+        'top',
+        'error'
+      );
+    },
+  });
+
+  // Handle delete meeting
+  const handleDeleteMeeting = (eventId: string, e?: any) => {
+    // Stop propagation to prevent navigation
+    if (e) {
+      e.stopPropagation();
     }
-  }, [isFocused]);
+    
+    // Confirm before deleting using Alert instead of confirm
+    Alert.alert(
+      'Delete Meeting',
+      'Are you sure you want to delete this meeting?',
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+        },
+        {
+          text: 'Delete',
+          onPress: () => deleteMeetingMutation.mutate(eventId),
+          style: 'destructive',
+        },
+      ],
+      { cancelable: true }
+    );
+  };
+
+  // Handle rename meeting
+  const handleRenameMeeting = () => {
+    if (!selectedMeeting || !newMeetingName.trim()) {
+      Toast.show('Please enter a valid meeting name', Toast.SHORT, 'top', 'error');
+      return;
+    }
+
+    renameMeetingMutation.mutate({
+      eventId: selectedMeeting.event_id,
+      meetingName: newMeetingName.trim(),
+    });
+  };
+
+  // Show menu for meeting options
+  const showMenu = (meeting: Meeting, x: number, y: number, e?: any) => {
+    if (e) {
+      e.stopPropagation();
+    }
+    setSelectedMeeting(meeting);
+    setMenuPosition({ x, y });
+    setMenuVisible(true);
+  };
+
+  // Hide menu
+  const hideMenu = () => {
+    setMenuVisible(false);
+  };
+
+  // Open rename dialog
+  const openRenameDialog = () => {
+    if (selectedMeeting) {
+      setNewMeetingName(selectedMeeting.meeting_title || `Recording ${selectedMeeting.id}`);
+      setRenameDialogVisible(true);
+      setMenuVisible(false);
+    }
+  };
 
   // Join meeting mutation
   const joinMeetingMutation = useMutation({
@@ -232,6 +335,13 @@ export default function RecordingListScreen() {
     }
   }, [userId, isFocused]);
   
+  // Handle refresh function for pull-to-refresh
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await refetch();
+    setRefreshing(false);
+  };
+  
   // Handle join meeting
   const handleJoinMeeting = () => {
     if (!meetingUrl) {
@@ -306,7 +416,8 @@ export default function RecordingListScreen() {
   };
   
   // Update the time format in VerticalMeetingCard
-  const VerticalMeetingCard = ({ meeting }: { meeting: Meeting }) => {
+  // Update the VerticalMeetingCard component to include three dots menu
+  const VerticalMeetingCard = ({ meeting, onShowMenu }: { meeting: Meeting, onShowMenu: (meeting: Meeting, x: number, y: number, e?: any) => void }) => {
     return (
       <TouchableOpacity 
         style={styles.verticalCard}
@@ -316,8 +427,19 @@ export default function RecordingListScreen() {
           <Text style={styles.verticalTitle} numberOfLines={1}>
             {meeting.meeting_title || `Recording ${meeting.id}`}
           </Text>
-          <View style={styles.statusBadge}>
-            <Text style={styles.statusText}>Process Completed</Text>
+          <View style={{flexDirection: 'row', alignItems: 'center'}}>
+            <View style={styles.statusBadge}>
+              <Text style={styles.statusText}>Process Completed</Text>
+            </View>
+            <TouchableOpacity 
+              style={styles.menuButton}
+              onPress={(e) => {
+                const { pageX, pageY } = e.nativeEvent;
+                onShowMenu(meeting, pageX, pageY, e);
+              }}
+            >
+              <Entypo name="dots-three-vertical" size={20} color="#BBBBBB" />
+            </TouchableOpacity>
           </View>
         </View>
         
@@ -345,11 +467,87 @@ export default function RecordingListScreen() {
   return (
     <View style={{ flex: 1 }}>
       <ThemeView>
-        {/* Feature Slider Dialog */}
-        <FeatureSliderDialog
-          visible={showFeatureDialog}
-          onClose={() => setShowFeatureDialog(false)}
-        />
+        {/* Rename Dialog */}
+        <Modal
+          transparent={true}
+          visible={renameDialogVisible}
+          animationType="fade"
+          onRequestClose={() => setRenameDialogVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>Rename Meeting</Text>
+              <TextInput
+                style={styles.renameInput}
+                value={newMeetingName}
+                onChangeText={setNewMeetingName}
+                placeholder="Enter new meeting name"
+                placeholderTextColor="#999"
+                autoFocus
+              />
+              <View style={styles.modalButtons}>
+                <TouchableOpacity 
+                  style={[styles.modalButton, styles.cancelButton]}
+                  onPress={() => setRenameDialogVisible(false)}
+                >
+                  <Text style={styles.cancelButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity 
+                  style={[styles.modalButton, styles.saveButton]}
+                  onPress={handleRenameMeeting}
+                  disabled={renameMeetingMutation.isPending}
+                >
+                  {renameMeetingMutation.isPending ? (
+                    <ActivityIndicator size="small" color="white" />
+                  ) : (
+                    <Text style={styles.saveButtonText}>Save</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Options Menu */}
+        {menuVisible && (
+          <TouchableOpacity 
+            style={styles.menuOverlay}
+            activeOpacity={1}
+            onPress={hideMenu}
+          >
+            <View 
+              style={[
+                styles.menuContainer,
+                {
+                  position: 'absolute',
+                  top: menuPosition.y - 80,
+                  right: 20,
+                }
+              ]}
+            >
+              <TouchableOpacity 
+                style={styles.menuItem}
+                onPress={openRenameDialog}
+              >
+                <AntDesign name="edit" size={18} color="#BBBBBB" />
+                <Text style={styles.menuItemText}>Rename</Text>
+              </TouchableOpacity>
+              <View style={styles.menuDivider} />
+              <TouchableOpacity 
+                style={styles.menuItem}
+                onPress={() => {
+                  hideMenu();
+                  if (selectedMeeting) {
+                    handleDeleteMeeting(selectedMeeting.event_id);
+                  }
+                }}
+              >
+                <AntDesign name="delete" size={18} color="#FF6B6B" />
+                <Text style={[styles.menuItemText, { color: '#FF6B6B' }]}>Delete</Text>
+              </TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        )}
 
         {isLoading || loadingUncategorized ? (
           <View style={styles.loaderContainer}>
@@ -367,7 +565,18 @@ export default function RecordingListScreen() {
             />
           </View>
         ) : (
-          <ScrollView style={styles.container}>
+          <ScrollView 
+            style={styles.container}
+            refreshControl={
+              viewAllMode ? 
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={onRefresh}
+                colors={["#007AFF"]}
+                tintColor="#007AFF"
+              /> : undefined
+            }
+          >
             {/* Greeting Section */}
             <View style={styles.greetingContainer}>
               <ThemeText className="text-2xl font-bold">
@@ -416,7 +625,7 @@ export default function RecordingListScreen() {
                 {allMeetings.length > 0 ? (
                   <FlatList
                     data={allMeetings.slice(0, 10)}
-                    renderItem={({ item, index }) => <HorizontalMeetingCard meeting={item} username={username} />} // Pass username as a prop
+                    renderItem={({ item, index }) => <HorizontalMeetingCard meeting={item} username={username} onDeleteMeeting={handleDeleteMeeting} onShowMenu={showMenu} />}
                     keyExtractor={(item, index) => `recent-${item.id}-${item.event_id}-${index}`}
                     horizontal
                     showsHorizontalScrollIndicator={false}
@@ -446,6 +655,7 @@ export default function RecordingListScreen() {
                       <VerticalMeetingCard 
                         key={`vertical-${meeting.id}-${meeting.event_id}-${meetingIndex}`} 
                         meeting={meeting} 
+                        onShowMenu={showMenu}
                       />
                     ))}
                   </View>
@@ -661,10 +871,112 @@ const styles = StyleSheet.create({
     top: 20,
     right: 20,
   },
+  deleteButton: {
+    marginLeft: 12,
+    padding: 4,
+  },
+  menuButton: {
+    marginLeft: 12,
+    padding: 4,
+  },
+  menuOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    zIndex: 1000,
+  },
+  menuContainer: {
+    backgroundColor: '#2A2A2A',
+    borderRadius: 8,
+    padding: 8,
+    width: 150,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+    zIndex: 1001,
+  },
+  menuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  menuItemText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    marginLeft: 10,
+  },
+  menuDivider: {
+    height: 1,
+    backgroundColor: '#444',
+    marginVertical: 4,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalContent: {
+    backgroundColor: '#2A2A2A',
+    borderRadius: 12,
+    padding: 20,
+    width: '80%',
+    maxWidth: 400,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: 'white',
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  renameInput: {
+    backgroundColor: '#333',
+    borderRadius: 8,
+    padding: 12,
+    color: 'white',
+    fontSize: 16,
+    marginBottom: 20,
+  },
+  modalButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  modalButton: {
+    flex: 1,
+    borderRadius: 8,
+    padding: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cancelButton: {
+    backgroundColor: '#444',
+    marginRight: 8,
+  },
+  saveButton: {
+    backgroundColor: '#0a7ea4',
+    marginLeft: 8,
+  },
+  cancelButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  saveButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
 });
 
 // Move the HorizontalMeetingCard component definition before it's used
-const HorizontalMeetingCard = ({ meeting, username }: { meeting: Meeting, username: string | undefined }) => {
+const HorizontalMeetingCard = ({ meeting, username, onDeleteMeeting, onShowMenu }: { meeting: Meeting, username: string | undefined, onDeleteMeeting: (eventId: string, e?: any) => void, onShowMenu: (meeting: Meeting, x: number, y: number, e?: any) => void }) => {
   return (
     <TouchableOpacity 
       style={styles.horizontalCard}
@@ -674,8 +986,19 @@ const HorizontalMeetingCard = ({ meeting, username }: { meeting: Meeting, userna
         <Text style={styles.recordingTitle} numberOfLines={1}>
           {meeting.meeting_title || `Recording ${meeting.id}`}
         </Text>
-        <View style={styles.statusBadge}>
-          <Text style={styles.statusText}>Process Completed</Text>
+        <View style={{flexDirection: 'row', alignItems: 'center'}}>
+          <View style={styles.statusBadge}>
+            <Text style={styles.statusText}>Process Completed</Text>
+          </View>
+          <TouchableOpacity 
+            style={styles.menuButton}
+            onPress={(e) => {
+              const { pageX, pageY } = e.nativeEvent;
+              onShowMenu(meeting, pageX, pageY, e);
+            }}
+          >
+            <Entypo name="dots-three-vertical" size={20} color="#BBBBBB" />
+          </TouchableOpacity>
         </View>
       </View>
 
