@@ -10,6 +10,7 @@ import { axiosApi, ProccessAudio } from "@/api/api";
 import { Toast } from "@/utils/toast";
 import { useNetworkState } from "expo-network";
 import { router } from "expo-router";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { getFormattedDate } from "@/utils/getFormattedTime";
 import { saveRecording } from "@/database/database";
 import { RecordingDetails } from "@/constants/RecordingDetails";
@@ -59,9 +60,13 @@ export default function RecordingScreen() {
         url: "/process-audio/",
         method: "POST",
         data: payload,
+        // Add timeout for large files processing request
+        timeout: 600000, // 10 minutes timeout for processing request
       }).then((res) => res.data);
       return response;
     },
+    retry: 2, // Add retry at the mutation level
+    retryDelay: 10000, // 10 seconds between retries
   });
 
   const uploadRecordingMutation = useMutation({
@@ -91,56 +96,194 @@ export default function RecordingScreen() {
           transformRequest: (data) => {
             return data;
           },
+          // Add timeout and increase it for large files
+          timeout: 300000, // 5 minutes timeout for large files
+          // Add onUploadProgress to track upload progress
+          onUploadProgress: (progressEvent) => {
+            const percentCompleted = Math.round(
+              (progressEvent.loaded * 100) / (progressEvent.total || 1)
+            );
+            console.log(`Upload progress: ${percentCompleted}%`);
+          },
         })
         .then((res) => res.data);
       return response;
     },
   });
 
+  // Track polling attempts for recording details
+  const pollingAttemptsRef = useRef(0);
+  // For large recordings (30+ minutes), we need to poll for a longer time
+  // 60 attempts * 15 seconds = 15 minutes max polling time
+  const maxPollingAttempts = 60;
+  const pollingInterval = 15000; // 15 seconds between polls for large files
+  
+  // Track if we're dealing with a large file
+  const isLargeFileRef = useRef(false);
+  
+  // Set this flag when we detect the recording is being processed
+  const isProcessingDetectedRef = useRef(false);
+  
   const recordingDetailsViewApi = useQuery({
     queryKey: ["meetingView", eventId],
     queryFn: async () => {
       const eventID = eventIdRef.current;
-      return await axiosApi({
-        url: makeUrlWithParams("/meeting-view/{{eventId}}/", {
-          eventId: eventID,
-        }),
-        method: "GET",
-      })
-        .then((e) => e.data)
-        .then((e) => {
-          if (
-            (e.trascription_status == "success" ||
-              e.trascription_status == "failed") &&
-            (e.error_message || e.summary)
-          ) {
-            const date = new Date()
-              .toISOString()
-              .replace("T", " ")
-              .slice(0, 19);
-            console.log(date);
-            saveRecording(e, eventID, date).then(() => {
-              router.push(`/recordingview?eventID=${eventID}`);
-              setEventId("");
-              setIsFectingRecordingDetails(false);
-            });
+      pollingAttemptsRef.current += 1;
+      
+      console.log(`Polling attempt ${pollingAttemptsRef.current}/${maxPollingAttempts} for event ID: ${eventID}`);
+      
+      // Implement exponential backoff for polling
+      const getPollingBackoff = () => {
+        // Start with normal interval, then increase if we detect it's a large file
+        if (isLargeFileRef.current && pollingAttemptsRef.current > 10) {
+          // After 10 attempts with a large file, increase polling interval
+          return pollingInterval * 1.5;
+        }
+        return pollingInterval;
+      };
+      
+      try {
+        const response = await axiosApi({
+          url: makeUrlWithParams("/meeting-view/{{eventId}}/", {
+            eventId: eventID,
+          }),
+          method: "GET",
+          // Add timeout for the polling request
+          timeout: 30000, // 30 seconds timeout for polling
+        });
+        
+        const data = response.data;
+        
+        // Check if the response indicates this is a large file being processed
+        if (data.error_message && 
+            (data.error_message.includes('still being processed') || 
+             data.error_message.includes('large file'))) {
+          isLargeFileRef.current = true;
+          isProcessingDetectedRef.current = true;
+          console.log('Detected large file being processed');
+        }
+        
+        // Check if processing is complete (success or failure)
+        if (
+          (data.trascription_status == "success" ||
+            data.trascription_status == "failed") &&
+          (data.error_message || data.summary)
+        ) {
+          const date = new Date()
+            .toISOString()
+            .replace("T", " ")
+            .slice(0, 19);
+          console.log('Processing completed:', data.trascription_status);
+          
+          // Reset polling counter
+          pollingAttemptsRef.current = 0;
+          isLargeFileRef.current = false;
+          isProcessingDetectedRef.current = false;
+          
+          // Save recording and navigate
+          await saveRecording(data, eventID, date);
+          
+          if (data.trascription_status === "success") {
+            Toast.show("Recording processed successfully!", Toast.SHORT, "top", "success");
+          } else {
+            Toast.show("Processing completed with issues. Check details.", Toast.SHORT, "top", "info");
           }
-          return e;
-        })
-        .catch((e) => {
+          
+          router.push(`/recordingview?eventID=${eventID}`);
+          setEventId("");
+          setIsFectingRecordingDetails(false);
+        } else if (pollingAttemptsRef.current >= maxPollingAttempts) {
+          // If we've reached max polling attempts but processing isn't complete
+          console.log('Maximum polling attempts reached, saving event ID for later');
+          
           Toast.show(
-            e.message?.message || "Error getting recording details",
+            "Processing is taking longer than expected. You can check status later.",
+            Toast.LONG,
+            "top",
+            "info"
+          );
+          
+          // Save the event ID for later checking
+          await AsyncStorage.setItem("pending_recording_event_id", eventID);
+          await AsyncStorage.setItem("pending_recording_timestamp", new Date().toISOString());
+          
+          // Reset polling counter
+          pollingAttemptsRef.current = 0;
+          setEventId("");
+          setIsFectingRecordingDetails(false);
+          
+          // Navigate to recordings list or home
+          router.back();
+        } else if (pollingAttemptsRef.current % 3 === 0 || 
+                  (isLargeFileRef.current && pollingAttemptsRef.current % 2 === 0)) {
+          // Show status updates more frequently for large files
+          const percentage = Math.round((pollingAttemptsRef.current / maxPollingAttempts) * 100);
+          
+          // For large files, provide more detailed status messages
+          if (isLargeFileRef.current) {
+            Toast.show(
+              `Processing large recording... (${percentage}%) This may take several minutes.`,
+              Toast.SHORT,
+              "top",
+              "info"
+            );
+          } else {
+            Toast.show(
+              `Still processing your recording... (${percentage}%)`,
+              Toast.SHORT,
+              "top",
+              "info"
+            );
+          }
+        }
+        
+        return data;
+      } catch (error) {
+        console.error('Error polling recording details:', error);
+        
+        // Check for specific error types
+        const typedError = error as any;
+        const isNetworkError = typedError.message?.includes('network') || 
+                              typedError.message?.includes('timeout') || 
+                              typedError.status === 503 || 
+                              typedError.status === 504;
+        
+        // For network errors, we should continue polling
+        if (isNetworkError) {
+          console.log('Network error during polling, will continue polling');
+          Toast.show(
+            "Network issue while checking status. Will retry...",
+            Toast.SHORT,
+            "top",
+            "info"
+          );
+        } else {
+          Toast.show(
+            (error as any).message?.message || "Error getting recording details",
             Toast.SHORT,
             "top",
             "error"
           );
+        }
+        
+        // If we've had too many consecutive errors, stop polling
+        // But be more lenient with large files
+        const maxConsecutiveErrors = isLargeFileRef.current ? 10 : 5;
+        
+        if (pollingAttemptsRef.current >= maxConsecutiveErrors && !isProcessingDetectedRef.current) {
+          console.log('Too many consecutive errors, stopping polling');
           setIsFectingRecordingDetails(false);
           setEventId("");
-          return e;
-        });
+          pollingAttemptsRef.current = 0;
+        }
+        
+        return { error: (error as any).message };
+      }
     },
     enabled: !!eventId,
-    refetchInterval: 5000,
+    refetchInterval: pollingInterval,
+    retry: 3,
+    retryDelay: (attemptIndex) => Math.min(1000 * Math.pow(2, attemptIndex), 10000), // Exponential backoff for retries
   });
 
   const cancelUpload = () => {
@@ -151,34 +294,142 @@ export default function RecordingScreen() {
     }
   };
 
+  // Track processing attempts
+  const processingAttemptsRef = useRef(0);
+  const maxProcessingAttempts = 10; // Increased from 3 to 10 for large files
+  
   const handleProccessRecording = (payload: ProccessAudio) => {
-    proccessRecordingMutation
-      .mutateAsync(payload)
-      .then((e) => {
-        console.log(e);
-        if (e.success) {
-          // Toast.show(
-          //   "File uploaded successfully.",
-          //   Toast.SHORT,
-          //   "top",
-          //   "success"
-          // );
-          setEventId(e.data.event_id);
-          setIsFectingRecordingDetails(true);
-        } else {
-          Toast.show(e.message, Toast.SHORT, "top", "error");
-        }
-      })
-      .catch((e) => {
+    // Reset attempts counter when starting a new processing request
+    processingAttemptsRef.current = 0;
+    
+    // Calculate retry delay based on attempt number (exponential backoff)
+    const getRetryDelay = (attempt: number) => {
+      // Start with 10 seconds, then 20, 40, etc. (capped at 2 minutes)
+      return Math.min(10000 * Math.pow(2, attempt - 1), 120000);
+    };
+    
+    const attemptProcessing = () => {
+      processingAttemptsRef.current += 1;
+      
+      // For large files, we need to be more patient with processing
+      const isLargeFile = payload.file_path.includes('large') || 
+                         (payload.meeting_title || '').toLowerCase().includes('large');
+      
+      // Show different messages based on attempt number
+      if (processingAttemptsRef.current === 1) {
         Toast.show(
-          e.message?.message || "Proccessing audio failed",
+          `Starting audio processing...`,
           Toast.SHORT,
           "top",
-          "error"
+          "info"
         );
-      });
+      } else {
+        Toast.show(
+          `Processing attempt ${processingAttemptsRef.current}/${maxProcessingAttempts}...`,
+          Toast.SHORT,
+          "top",
+          "info"
+        );
+      }
+      
+      console.log(`Processing attempt ${processingAttemptsRef.current}/${maxProcessingAttempts} for file: ${payload.file_path}`);
+      
+      proccessRecordingMutation
+        .mutateAsync(payload)
+        .then((e) => {
+          console.log('Processing response:', e);
+          if (e.success) {
+            processingAttemptsRef.current = 0; // Reset counter on success
+            setEventId(e.data.event_id);
+            setIsFectingRecordingDetails(true);
+            Toast.show(
+              "Processing started successfully",
+              Toast.SHORT,
+              "top",
+              "success"
+            );
+          } else {
+            console.error('Processing failed with message:', e.message);
+            Toast.show(e.message, Toast.SHORT, "top", "error");
+            
+            // Retry logic for processing with exponential backoff
+            if (processingAttemptsRef.current < maxProcessingAttempts) {
+              const retryDelay = getRetryDelay(processingAttemptsRef.current);
+              
+              Toast.show(
+                `Retrying processing in ${retryDelay/1000} seconds... (Attempt ${processingAttemptsRef.current}/${maxProcessingAttempts})`,
+                Toast.LONG,
+                "top",
+                "info"
+              );
+              setTimeout(attemptProcessing, retryDelay);
+            } else {
+              Toast.show(
+                "Maximum processing attempts reached. Please try again later.",
+                Toast.LONG,
+                "top",
+                "error"
+              );
+              setShowRetry(true);
+            }
+          }
+        })
+        .catch((e) => {
+          console.error('Processing error:', e);
+          
+          // Check if error is related to timeout or server overload
+          const isTimeoutOrServerError = 
+            e.message?.includes('timeout') || 
+            e.message?.includes('network') || 
+            e.status === 503 || 
+            e.status === 504;
+          
+          // For timeout errors, we should definitely retry
+          if (isTimeoutOrServerError) {
+            console.log('Detected timeout or server error, will retry with longer delay');
+          }
+          
+          Toast.show(
+            e.message?.message || "Processing audio failed",
+            Toast.SHORT,
+            "top",
+            "error"
+          );
+          
+          // Retry logic for errors with exponential backoff
+          if (processingAttemptsRef.current < maxProcessingAttempts) {
+            const retryDelay = getRetryDelay(processingAttemptsRef.current);
+            
+            // Use longer delay for timeout errors
+            const adjustedDelay = isTimeoutOrServerError ? retryDelay * 2 : retryDelay;
+            
+            Toast.show(
+              `Retrying processing in ${adjustedDelay/1000} seconds... (Attempt ${processingAttemptsRef.current}/${maxProcessingAttempts})`,
+              Toast.LONG,
+              "top",
+              "info"
+            );
+            setTimeout(attemptProcessing, adjustedDelay);
+          } else {
+            Toast.show(
+              "Maximum processing attempts reached. Please try again later.",
+              Toast.LONG,
+              "top",
+              "error"
+            );
+            setShowRetry(true);
+          }
+        });
+    };
+    
+    // Start the first attempt
+    attemptProcessing();
   };
 
+  // Define file size thresholds for different handling
+  const LARGE_FILE_THRESHOLD_MB = 50;
+  const VERY_LARGE_FILE_THRESHOLD_MB = 100;
+  
   const handleUpload = async (uri: string) => {
     try {
       if (!networkState.isConnected) {
@@ -194,55 +445,143 @@ export default function RecordingScreen() {
       setShowRetry(false);
 
       const date = getFormattedDate();
+      let fileSizeInMB = 0;
+      let isLargeFile = false;
+      let isVeryLargeFile = false;
+      
+      // Check file size before uploading
+      try {
+        const fileInfo = await fetch(uri);
+        const blob = await fileInfo.blob();
+        fileSizeInMB = blob.size / (1024 * 1024);
+        console.log(`File size: ${fileSizeInMB.toFixed(2)} MB`);
+        
+        isLargeFile = fileSizeInMB > LARGE_FILE_THRESHOLD_MB;
+        isVeryLargeFile = fileSizeInMB > VERY_LARGE_FILE_THRESHOLD_MB;
+        
+        // Warn user if file is large
+        if (isVeryLargeFile) {
+          Toast.show(
+            `Very large file (${fileSizeInMB.toFixed(2)} MB). Upload and processing may take significantly longer.`,
+            Toast.LONG,
+            "top",
+            "info"
+          );
+        } else if (isLargeFile) {
+          Toast.show(
+            `Large file (${fileSizeInMB.toFixed(2)} MB). Upload may take longer.`,
+            Toast.LONG,
+            "top",
+            "info"
+          );
+        }
+      } catch (error) {
+        console.log("Error checking file size:", error);
+      }
 
+      // Create a more descriptive filename that includes file size for better server-side handling
+      const fileSize = fileSizeInMB > 0 ? `_${fileSizeInMB.toFixed(0)}MB` : '';
+      const fileType = isLargeFile ? '_large' : '';
+      
       const file = {
         uri: uri,
-        name: `audio-${date}.m4a`,
+        name: `audio-${date}${fileSize}${fileType}.m4a`,
         type: "audio/*",
       };
 
+      Toast.show("Preparing upload...", Toast.SHORT, "top", "info");
+      
       uploadRecordingMutation
         .mutateAsync()
         .then((e) => {
-          console.log(e);
+          console.log('Presigned URL response:', e);
           if (e.success) {
+            Toast.show("Starting upload...", Toast.SHORT, "top", "info");
             uploadRecordToS3
               .mutateAsync({
                 file: file as unknown as Blob,
                 url: e.data.url,
               })
               .then(() => {
-                Toast.show("Uploaded Successfully!", Toast.SHORT, "top");
-                const date = getFormattedDate();
-                handleProccessRecording({
-                  file_url: e.data.url,
-                  file_path: e.data.file_path,
-                  meeting_title: `recording ${date}`,
-                });
+                Toast.show("Uploaded Successfully!", Toast.SHORT, "top", "success");
+                
+                // Calculate appropriate delay based on file size
+                // Larger files need more time for S3 to process
+                let processingDelay = 1000; // Default 1 second
+                
+                if (isVeryLargeFile) {
+                  processingDelay = 10000; // 10 seconds for very large files
+                  Toast.show(
+                    "Very large file uploaded. Preparing for processing...",
+                    Toast.LONG,
+                    "top",
+                    "info"
+                  );
+                } else if (isLargeFile) {
+                  processingDelay = 5000; // 5 seconds for large files
+                  Toast.show(
+                    "Large file uploaded. Preparing for processing...",
+                    Toast.SHORT,
+                    "top",
+                    "info"
+                  );
+                }
+                
+                // Add a delay before processing to ensure S3 has fully processed the upload
+                // The delay is proportional to the file size
+                setTimeout(() => {
+                  Toast.show("Starting audio processing...", Toast.SHORT, "top", "info");
+                  
+                  // Create a more descriptive meeting title that includes file size
+                  const meetingTitle = isLargeFile 
+                    ? `recording ${date} (large ${fileSizeInMB.toFixed(0)}MB)` 
+                    : `recording ${date}`;
+                  
+                  handleProccessRecording({
+                    file_url: e.data.url,
+                    file_path: e.data.file_path,
+                    meeting_title: meetingTitle,
+                  });
+                }, processingDelay);
               })
               .catch((e) => {
                 if (axios.isCancel(e)) {
                   Toast.show("Upload canceled", Toast.SHORT, "top", "info");
                 } else {
-                  Toast.show("Upload Failed!", Toast.SHORT, "top");
+                  console.error("Upload error:", e);
+                  
+                  // Provide more specific error messages for common upload issues
+                  let errorMessage = "Upload Failed! Please try again.";
+                  
+                  if (e.message?.includes('timeout')) {
+                    errorMessage = "Upload timed out. Try with a smaller file or better connection.";
+                  } else if (e.message?.includes('network')) {
+                    errorMessage = "Network error during upload. Check your connection and try again.";
+                  }
+                  
+                  Toast.show(errorMessage, Toast.LONG, "top", "error");
                   setShowRetry(true);
                 }
               });
           } else {
-            Toast.show("Upload Failed!", Toast.SHORT, "top");
+            Toast.show("Failed to get upload URL!", Toast.SHORT, "top", "error");
             setShowRetry(true);
           }
         })
         .catch((e) => {
+          console.error("Upload preparation error:", e);
           Toast.show(
             e.message?.message || "Upload Failed!",
             Toast.SHORT,
-            "top"
+            "top",
+            "error"
           );
           setShowRetry(true);
         });
     } catch (error) {
-      console.log(error);
+      console.error("Unexpected upload error:", error);
+      Toast.show("Unexpected error during upload", Toast.SHORT, "top", "error");
+      setShowRetry(true);
     }
   };
 
@@ -263,6 +602,37 @@ export default function RecordingScreen() {
   //   saveRecording(RecordingDetails, "78d79690-b854-4f6a-a02b-1dba02cd73ac");
   // };
 
+  // Check for pending recordings when component mounts
+  useEffect(() => {
+    const checkPendingRecordings = async () => {
+      try {
+        const pendingEventId = await AsyncStorage.getItem("pending_recording_event_id");
+        if (pendingEventId) {
+          // Ask user if they want to check the status of the pending recording
+          const userWantsToCheck = window.confirm(
+            "You have a recording that was being processed. Do you want to check its status?"
+          );
+          
+          if (userWantsToCheck) {
+            // Clear the pending recording ID
+            await AsyncStorage.removeItem("pending_recording_event_id");
+            
+            // Navigate to the recording view
+            router.push(`/recordingview?eventID=${pendingEventId}`);
+          } else {
+            // Clear the pending recording ID if user doesn't want to check
+            await AsyncStorage.removeItem("pending_recording_event_id");
+          }
+        }
+      } catch (error) {
+        console.error("Error checking pending recordings:", error);
+      }
+    };
+    
+    checkPendingRecordings();
+  }, []);
+  
+  // Keep device awake during recording
   useEffect(() => {
     const enableKeepAwake = async () => {
       await activateKeepAwakeAsync();
