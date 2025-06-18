@@ -44,12 +44,68 @@ export default function RecordingViewScreen() {
   const isPublic = meetingData?.is_public ?? false;
 
   if (meetingData?.error_message) {
+    const isProcessing = meetingData.error_message.includes('still being processed');
+    const isLargeFile = meetingData.error_message.includes('large file') || 
+                       meetingData.error_message.includes('30 min') || 
+                       meetingData.error_message.includes('longer recording');
+    
     return (
       <ThemeView>
-        <View className="flex-1 justify-center items-center">
-          <ThemeText className="text-lg">
+        <View className="flex-1 justify-center items-center px-6">
+          {/* Back button */}
+          <View className="absolute top-4 left-4">
+            <CustomButton
+              onPress={() => router.back()}
+              icon={<MaterialIcons name="arrow-back-ios-new" size={20} color="white" />}
+              className="p-2 rounded-full"
+            />
+          </View>
+          
+          <ActivityIndicator size="large" color="#004aad" />
+          <ThemeText className="text-lg text-center mt-4">
             {meetingData.error_message}
           </ThemeText>
+          
+          {isProcessing && (
+            <View className="mt-6 w-full">
+              <ThemeText className="text-sm text-center mb-4 text-gray-400">
+                {isLargeFile ? 
+                  "Large recordings (30+ minutes) require more processing time. This may take several minutes to complete." :
+                  "Your recording is still being processed. This should complete shortly."}
+              </ThemeText>
+              
+              <View className="flex-row justify-center gap-4 w-full">
+                <CustomButton
+                  onPress={() => {
+                    // Force a refetch of the meeting data
+                    Toast.show("Checking processing status...", Toast.SHORT, "top", "info");
+                    // We're using the same hook that's used in this component, so we just need to
+                    // navigate away and back to trigger a refetch
+                    router.replace('/');
+                    setTimeout(() => {
+                      router.push(`/recordingview?eventID=${eventID}`);
+                    }, 500);
+                  }}
+                  title="Check Status"
+                  className="py-3 rounded-lg flex-1"
+                  style={{ backgroundColor: '#0a7ea4' }}
+                />
+                
+                <CustomButton
+                  onPress={() => router.replace('/')}
+                  title="Go to Home"
+                  className="py-3 rounded-lg flex-1"
+                />
+              </View>
+              
+              {isLargeFile && (
+                <ThemeText className="text-xs text-center mt-4 text-gray-500">
+                  Tip: For recordings longer than 30 minutes, you may need to check back multiple times.
+                  The system will continue processing in the background.
+                </ThemeText>
+              )}
+            </View>
+          )}
         </View>
       </ThemeView>
     );
@@ -60,6 +116,9 @@ export default function RecordingViewScreen() {
       <ThemeView>
         <View className="flex-1 justify-center items-center">
           <ActivityIndicator size="large" color="#004aad" />
+          <ThemeText className="text-lg text-center mt-4">
+            Loading meeting data...
+          </ThemeText>
         </View>
       </ThemeView>
     );
