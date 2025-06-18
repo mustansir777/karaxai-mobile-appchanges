@@ -1,20 +1,36 @@
 // app/(tabs)/settings.tsx
-import React from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Alert } from 'react-native';
 import { ThemeView } from "@/components/theme/ThemeView";
 import { ThemeText } from "@/components/theme/ThemeText";
 import useAuthStorage from "@/hooks/useAuthData";
+import useOnboardingStatus from "@/hooks/useOnboardingStatus";
 import FontAwesome from "@expo/vector-icons/FontAwesome5";
 import { router } from "expo-router";
 import * as Linking from 'expo-linking';
+import OnboardingModal from "@/components/onboarding/OnboardingModal";
 
 export default function SettingsScreen() {
   const auth = useAuthStorage();
+  const { onboardingStatus } = useOnboardingStatus();
+  const [showOnboarding, setShowOnboarding] = useState(false);
+
+  const handleOnboardingPress = () => {
+    if (onboardingStatus.completed) {
+      Alert.alert(
+        "Onboarding Completed",
+        "You have already completed the onboarding process.",
+        [{ text: "OK", style: "default" }]
+      );
+    } else {
+      setShowOnboarding(true);
+    }
+  };
 
   return (
     <ThemeView>
       <View style={styles.container}>
-        <ThemeText style={styles.title}>Settings</ThemeText>
+        <ThemeText style={{ fontSize: 24, fontWeight: 'bold', marginBottom: 20 }} className="text-white">Settings</ThemeText>
         
         <TouchableOpacity style={styles.settingItem} onPress={() => router.push("/profile")}>
           <View style={styles.iconContainer}>
@@ -36,6 +52,8 @@ export default function SettingsScreen() {
           </View>
           <FontAwesome name="chevron-right" size={16} color="#BBBBBB" />
         </TouchableOpacity>
+        
+
         
         {/* <TouchableOpacity style={styles.settingItem}>
           <View style={styles.iconContainer}>
@@ -81,6 +99,11 @@ export default function SettingsScreen() {
           <FontAwesome name="chevron-right" size={16} color="#BBBBBB" />
         </TouchableOpacity>
       </View>
+      
+      <OnboardingModal 
+        visible={showOnboarding} 
+        onClose={() => setShowOnboarding(false)} 
+      />
     </ThemeView>
   );
 }
@@ -123,5 +146,8 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#929292',
     marginTop: 2,
+  },
+  completedText: {
+    color: '#4CAF50',
   }
 });
