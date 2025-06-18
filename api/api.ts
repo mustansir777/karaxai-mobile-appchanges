@@ -409,6 +409,31 @@ interface AllApiEndpoints {
     };
   };
 
+  "/delete-meeting/{{meeting_event_id}}/": {
+    request: {
+      method: "DELETE";
+      params?: undefined;
+      data?: undefined;
+    };
+    response: {
+      success: boolean;
+      message: string;
+    };
+  };
+  "/rename-meeting/{{meeting_event_id}}/": {
+    request: {
+      method: "POST";
+      params?: undefined;
+      data: {
+        meeting_name: string;
+      };
+    };
+    response: {
+      success: boolean;
+      message: string;
+    };
+  };
+
     "/delete-account/": {
     request: {
       method: "POST";
