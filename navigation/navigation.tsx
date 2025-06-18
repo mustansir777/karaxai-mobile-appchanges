@@ -66,8 +66,7 @@ export default function Navigation() {
         name="transcription"
         options={{ headerShown: false }}
       />
-
-      
+ 
     </Stack>
   );
 }
