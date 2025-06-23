@@ -77,12 +77,82 @@ interface Meeting {
   organizer_email: string;
   source: string;
   bot_id: number;
+  processing_status?: 'processing' | 'completed' | 'failed';
+  trascription_status?: string;
 }
 
 interface GroupedMeeting {
   date: string;
   meetings: Meeting[];
 }
+
+// Status Badge Component
+const StatusBadge = ({ meeting }: { meeting: Meeting }) => {
+  const getStatusConfig = () => {
+    // Check processing_status first, then fallback to trascription_status
+    const status = meeting.processing_status || meeting.trascription_status;
+    
+    switch (status) {
+      case 'processing':
+        return {
+          text: 'Processing...',
+          bgColor: 'rgba(255, 193, 7, 0.2)', // Yellow background
+          textColor: '#FFC107', // Yellow text
+          showSpinner: true
+        };
+      case 'completed':
+        return {
+          text: 'Process Completed',
+          bgColor: 'rgba(39, 174, 96, 0.2)', // Green background
+          textColor: '#27AE60', // Green text
+          showSpinner: false
+        };
+      case 'success':
+        // Only show "Process Completed" for success when it's truly completed
+        // If it's still in the processing pipeline, keep showing "Processing..."
+        return {
+          text: 'Process Completed',
+          bgColor: 'rgba(39, 174, 96, 0.2)', // Green background
+          textColor: '#27AE60', // Green text
+          showSpinner: false
+        };
+      case 'failed':
+        return {
+          text: 'Processing Failed',
+          bgColor: 'rgba(231, 76, 60, 0.2)', // Red background
+          textColor: '#E74C3C', // Red text
+          showSpinner: false
+        };
+      default:
+        // For any undefined status, show as completed (legacy recordings)
+        return {
+          text: 'Process Completed',
+          bgColor: 'rgba(39, 174, 96, 0.2)',
+          textColor: '#27AE60',
+          showSpinner: false
+        };
+    }
+  };
+
+  const config = getStatusConfig();
+
+  return (
+    <View style={[styles.statusBadge, { backgroundColor: config.bgColor }]}>
+      <View style={styles.statusContent}>
+        {config.showSpinner && (
+          <ActivityIndicator 
+            size="small" 
+            color={config.textColor} 
+            style={{ marginRight: 6 }}
+          />
+        )}
+        <Text style={[styles.statusText, { color: config.textColor }]}>
+          {config.text}
+        </Text>
+      </View>
+    </View>
+  );
+};
 
 export default function RecordingList() {
   const todayDate = getTodayDate();
@@ -105,6 +175,9 @@ export default function RecordingList() {
   const [menuPosition, setMenuPosition] = useState({ x: 0, y: 0 });
   const [renameDialogVisible, setRenameDialogVisible] = useState(false);
   const [newMeetingName, setNewMeetingName] = useState("");
+
+  // Auto-refresh for processing recordings
+  const autoRefreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Delete meeting mutation
   const deleteMeetingMutation = useMutation({
@@ -264,7 +337,22 @@ export default function RecordingList() {
       });
       return response.data;
     },
-    enabled: !!userId && isFocused
+    enabled: !!userId && isFocused,
+    refetchInterval: (query) => {
+      // Auto-refresh every 10 seconds if there are processing recordings
+      const data = query.state.data;
+      if (!data || !Array.isArray(data)) {
+        return false; // No auto-refresh if no data
+      }
+      
+      const hasProcessingRecordings = data.some((category: any) => 
+        category?.meetings?.some((meeting: any) => 
+          meeting?.processing_status === 'processing' || 
+          meeting?.trascription_status === 'processing'
+        )
+      );
+      return hasProcessingRecordings ? 10000 : false; // 10 seconds if processing, otherwise no auto-refresh
+    }
   });
   
   // Query for uncategorized meetings
@@ -280,7 +368,22 @@ export default function RecordingList() {
       });
       return response.data;
     },
-    enabled: !!userId && isFocused
+    enabled: !!userId && isFocused,
+    refetchInterval: (query) => {
+      // Auto-refresh every 10 seconds if there are processing recordings
+      const data = query.state.data;
+      if (!data || !Array.isArray(data)) {
+        return false; // No auto-refresh if no data
+      }
+      
+      const hasProcessingRecordings = data.some((category: any) => 
+        category?.meetings?.some((meeting: any) => 
+          meeting?.processing_status === 'processing' || 
+          meeting?.trascription_status === 'processing'
+        )
+      );
+      return hasProcessingRecordings ? 10000 : false; // 10 seconds if processing, otherwise no auto-refresh
+    }
   });
   
   // Update categories and all meetings when data changes
@@ -322,6 +425,45 @@ export default function RecordingList() {
     
     setAllMeetings(meetings);
   }, [categoriesData, uncategorizedData]);
+  
+  // Check for processing recordings and set up auto-refresh
+  useEffect(() => {
+    const hasProcessingRecordings = allMeetings.some(meeting => 
+      meeting.processing_status === 'processing' || 
+      meeting.trascription_status === 'processing'
+    );
+
+    if (hasProcessingRecordings && !autoRefreshIntervalRef.current) {
+      // Set up auto-refresh for processing recordings
+      console.log('Setting up auto-refresh for processing recordings');
+      autoRefreshIntervalRef.current = setInterval(() => {
+        console.log('Auto-refreshing due to processing recordings');
+        refetch();
+      }, 15000); // Refresh every 15 seconds
+    } else if (!hasProcessingRecordings && autoRefreshIntervalRef.current) {
+      // Clear auto-refresh when no processing recordings
+      console.log('Clearing auto-refresh - no processing recordings');
+      clearInterval(autoRefreshIntervalRef.current);
+      autoRefreshIntervalRef.current = null;
+    }
+
+    return () => {
+      if (autoRefreshIntervalRef.current) {
+        clearInterval(autoRefreshIntervalRef.current);
+        autoRefreshIntervalRef.current = null;
+      }
+    };
+  }, [allMeetings, refetch]);
+
+  // Clean up auto-refresh on unmount
+  useEffect(() => {
+    return () => {
+      if (autoRefreshIntervalRef.current) {
+        clearInterval(autoRefreshIntervalRef.current);
+        autoRefreshIntervalRef.current = null;
+      }
+    };
+  }, []);
   
   // Synchronize meetings
   useEffect(() => {
@@ -428,9 +570,7 @@ export default function RecordingList() {
             {meeting.meeting_title || `Recording ${meeting.id}`}
           </Text>
           <View style={{flexDirection: 'row', alignItems: 'center'}}>
-            <View style={styles.statusBadge}>
-              <Text style={styles.statusText}>Process Completed</Text>
-            </View>
+            <StatusBadge meeting={meeting} />
             <TouchableOpacity 
               style={styles.menuButton}
               onPress={(e) => {
@@ -792,13 +932,18 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   statusBadge: {
-    backgroundColor: 'rgba(39, 174, 96, 0.2)',
     paddingHorizontal: 12,
     paddingVertical: 4,
     borderRadius: 16,
+    minHeight: 24,
+    justifyContent: 'center',
+  },
+  statusContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   statusText: {
-    color: '#27AE60',
     fontSize: 12,
     fontWeight: '500',
   },
@@ -987,9 +1132,7 @@ const HorizontalMeetingCard = ({ meeting, username, onDeleteMeeting, onShowMenu 
           {meeting.meeting_title || `Recording ${meeting.id}`}
         </Text>
         <View style={{flexDirection: 'row', alignItems: 'center'}}>
-          <View style={styles.statusBadge}>
-            <Text style={styles.statusText}>Process Completed</Text>
-          </View>
+          <StatusBadge meeting={meeting} />
           <TouchableOpacity 
             style={styles.menuButton}
             onPress={(e) => {
