@@ -1,15 +1,15 @@
 import { CustomButton } from "@/components/button/CustomButton";
 import Recorder from "@/components/recorder/Recorder";
 import { ThemeView } from "@/components/theme/ThemeView";
-import { ActivityIndicator, Animated, Text, View } from "react-native";
+import { ActivityIndicator, Animated, Text, View, Alert } from "react-native";
 import FontAwesome6 from "@expo/vector-icons/FontAwesome6";
 import { useRecording } from "@/hooks/useRecording";
 import { useEffect, useRef, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { axiosApi, ProccessAudio } from "@/api/api";
 import { Toast } from "@/utils/toast";
 import { useNetworkState } from "expo-network";
-import { router } from "expo-router";
+import { router, usePathname } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { getFormattedDate } from "@/utils/getFormattedTime";
 import { saveRecording } from "@/database/database";
@@ -29,6 +29,9 @@ export default function RecordingScreen() {
   const [showRetry, setShowRetry] = useState(false);
   const recordUriRef = useRef<string>("");
   const scaleAnim = useRef(new Animated.Value(1)).current;
+  const queryClient = useQueryClient();
+  const pathname = usePathname(); // Add this to get current route
+  
   const {
     startRecording,
     stopRecording,
@@ -52,6 +55,112 @@ export default function RecordingScreen() {
   };
 
   const cancelTokenRef = useRef<CancelTokenSource | null>(null);
+
+  // Helper function to update recording status in cache
+  const updateRecordingStatusInCache = (eventId: string, status: 'processing' | 'completed' | 'failed') => {
+    // Update categoriesWithMeetings cache
+    queryClient.setQueryData(['categoriesWithMeetings'], (oldData: any) => {
+      if (!oldData) return oldData;
+      
+      const updatedData = { ...oldData };
+      if (updatedData.data) {
+        updatedData.data = updatedData.data.map((category: any) => {
+          if (category.meetings) {
+            return {
+              ...category,
+              meetings: category.meetings.map((meeting: any) => {
+                if (meeting.event_id === eventId) {
+                  return {
+                    ...meeting,
+                    processing_status: status,
+                    trascription_status: status === 'completed' ? 'success' : status === 'failed' ? 'failed' : 'processing'
+                  };
+                }
+                return meeting;
+              })
+            };
+          }
+          return category;
+        });
+      }
+      return updatedData;
+    });
+
+    // Update uncategorizedMeetings cache
+    queryClient.setQueryData(['uncategorizedMeetings'], (oldData: any) => {
+      if (!oldData) return oldData;
+      
+      const updatedData = { ...oldData };
+      if (updatedData.data) {
+        updatedData.data = updatedData.data.map((category: any) => {
+          if (category.meetings) {
+            return {
+              ...category,
+              meetings: category.meetings.map((meeting: any) => {
+                if (meeting.event_id === eventId) {
+                  return {
+                    ...meeting,
+                    processing_status: status,
+                    trascription_status: status === 'completed' ? 'success' : status === 'failed' ? 'failed' : 'processing'
+                  };
+                }
+                return meeting;
+              })
+            };
+          }
+          return category;
+        });
+      }
+      return updatedData;
+    });
+
+    // Invalidate and refetch the queries to ensure UI updates
+    queryClient.invalidateQueries({ queryKey: ['categoriesWithMeetings'] });
+    queryClient.invalidateQueries({ queryKey: ['uncategorizedMeetings'] });
+  };
+
+  // Helper function to add new recording to cache with processing status
+  const addNewRecordingToCache = (eventId: string, meetingTitle: string, date: string) => {
+    const newRecording = {
+      id: Date.now(), // Temporary ID
+      event_id: eventId,
+      meeting_title: meetingTitle,
+      meeting_date: date.split(' ')[0], // Extract date part
+      meeting_start_time: date.split(' ')[1] || '00:00:00', // Extract time part
+      meeting_end_time: date.split(' ')[1] || '00:00:00',
+      processing_status: 'processing',
+      trascription_status: 'processing',
+      categoryId: 0,
+      meet_url: '',
+      meeting_admin_id: 0,
+      meeting_code: null,
+      organizer_email: '',
+      source: 'recording',
+      bot_id: 0
+    };
+
+    // Add to uncategorized meetings cache
+    queryClient.setQueryData(['uncategorizedMeetings'], (oldData: any) => {
+      if (!oldData) return { data: [{ meetings: [newRecording] }] };
+      
+      const updatedData = { ...oldData };
+      if (updatedData.data && updatedData.data.length > 0) {
+        // Add to first category's meetings
+        updatedData.data[0] = {
+          ...updatedData.data[0],
+          meetings: [newRecording, ...(updatedData.data[0].meetings || [])]
+        };
+      } else {
+        // Create new category with the recording
+        updatedData.data = [{ meetings: [newRecording] }];
+      }
+      return updatedData;
+    });
+
+    // Invalidate queries to trigger UI updates
+    queryClient.invalidateQueries({ queryKey: ['categoriesWithMeetings'] });
+    queryClient.invalidateQueries({ queryKey: ['uncategorizedMeetings'] });
+  };
 
   const proccessRecordingMutation = useMutation({
     mutationKey: ["transcribe"],
@@ -161,6 +270,9 @@ export default function RecordingScreen() {
           isLargeFileRef.current = true;
           isProcessingDetectedRef.current = true;
           console.log('Detected large file being processed');
+          
+          // Update status to processing in the UI
+          updateRecordingStatusInCache(eventID, 'processing');
         }
         
         // Check if processing is complete (success or failure)
@@ -180,8 +292,12 @@ export default function RecordingScreen() {
           isLargeFileRef.current = false;
           isProcessingDetectedRef.current = false;
           
-          // Save recording and navigate
+          // Save recording first
           await saveRecording(data, eventID, date);
+          
+          // Only update status to completed AFTER successful save and success message
+          const finalStatus = data.trascription_status === "success" ? 'completed' : 'failed';
+          updateRecordingStatusInCache(eventID, finalStatus);
           
           if (data.trascription_status === "success") {
             Toast.show("Recording processed successfully!", Toast.SHORT, "top", "success");
@@ -189,12 +305,20 @@ export default function RecordingScreen() {
             Toast.show("Processing completed with issues. Check details.", Toast.SHORT, "top", "info");
           }
           
-          router.push(`/recordingview?eventID=${eventID}`);
+          // Only navigate if user is still on the recording screen
+          // If they're already on the recording list, the status will update automatically
+          if (pathname && pathname.includes('recording') && !pathname.includes('recordinglist')) {
+            router.push(`/recordingview?eventID=${eventID}`);
+          }
+          
           setEventId("");
           setIsFectingRecordingDetails(false);
         } else if (pollingAttemptsRef.current >= maxPollingAttempts) {
           // If we've reached max polling attempts but processing isn't complete
           console.log('Maximum polling attempts reached, saving event ID for later');
+          
+          // Update status to failed in cache
+          updateRecordingStatusInCache(eventID, 'failed');
           
           Toast.show(
             "Processing is taking longer than expected. You can check status later.",
@@ -218,6 +342,9 @@ export default function RecordingScreen() {
                   (isLargeFileRef.current && pollingAttemptsRef.current % 2 === 0)) {
           // Show status updates more frequently for large files
           const percentage = Math.round((pollingAttemptsRef.current / maxPollingAttempts) * 100);
+          
+          // Update processing status in cache during polling
+          updateRecordingStatusInCache(eventID, 'processing');
           
           // For large files, provide more detailed status messages
           if (isLargeFileRef.current) {
@@ -272,6 +399,8 @@ export default function RecordingScreen() {
         
         if (pollingAttemptsRef.current >= maxConsecutiveErrors && !isProcessingDetectedRef.current) {
           console.log('Too many consecutive errors, stopping polling');
+          // Update status to failed in cache
+          updateRecordingStatusInCache(eventIdRef.current, 'failed');
           setIsFectingRecordingDetails(false);
           setEventId("");
           pollingAttemptsRef.current = 0;
@@ -340,14 +469,29 @@ export default function RecordingScreen() {
           console.log('Processing response:', e);
           if (e.success) {
             processingAttemptsRef.current = 0; // Reset counter on success
-            setEventId(e.data.event_id);
+            const currentEventId = e.data.event_id;
+            setEventId(currentEventId);
             setIsFectingRecordingDetails(true);
+            
+            // Add new recording to cache with processing status immediately
+            const currentDate = new Date().toISOString().replace("T", " ").slice(0, 19);
+            addNewRecordingToCache(currentEventId, payload.meeting_title, currentDate);
+            
             Toast.show(
-              "Processing started successfully",
-              Toast.SHORT,
+              "Processing started successfully! You can monitor progress in your recordings.",
+              Toast.LONG,
               "top",
               "success"
             );
+
+            // Redirect to recording list immediately after processing starts
+            // This allows user to see the "Processing..." status in the list
+            setTimeout(() => {
+              router.push('/(tabs)/recordinglist');
+            }, 1000); // Small delay to ensure cache is updated and user sees the success message
+
+            // Continue polling in background for status updates
+            // The polling will continue and update the cache automatically
           } else {
             console.error('Processing failed with message:', e.message);
             Toast.show(e.message, Toast.SHORT, "top", "error");
@@ -608,21 +752,34 @@ export default function RecordingScreen() {
       try {
         const pendingEventId = await AsyncStorage.getItem("pending_recording_event_id");
         if (pendingEventId) {
-          // Ask user if they want to check the status of the pending recording
-          const userWantsToCheck = window.confirm(
-            "You have a recording that was being processed. Do you want to check its status?"
+          // Ask user if they want to check the status of the pending recording using Alert
+          Alert.alert(
+            "Pending Recording Found",
+            "You have a recording that was being processed. Do you want to check its status?",
+            [
+              {
+                text: "No",
+                style: "cancel",
+                onPress: async () => {
+                  // Clear the pending recording ID if user doesn't want to check
+                  await AsyncStorage.removeItem("pending_recording_event_id");
+                  await AsyncStorage.removeItem("pending_recording_timestamp");
+                }
+              },
+              {
+                text: "Yes",
+                onPress: async () => {
+                  // Clear the pending recording ID
+                  await AsyncStorage.removeItem("pending_recording_event_id");
+                  await AsyncStorage.removeItem("pending_recording_timestamp");
+                  
+                  // Navigate to the recording view
+                  router.push(`/recordingview?eventID=${pendingEventId}`);
+                }
+              }
+            ],
+            { cancelable: false }
           );
-          
-          if (userWantsToCheck) {
-            // Clear the pending recording ID
-            await AsyncStorage.removeItem("pending_recording_event_id");
-            
-            // Navigate to the recording view
-            router.push(`/recordingview?eventID=${pendingEventId}`);
-          } else {
-            // Clear the pending recording ID if user doesn't want to check
-            await AsyncStorage.removeItem("pending_recording_event_id");
-          }
         }
       } catch (error) {
         console.error("Error checking pending recordings:", error);
