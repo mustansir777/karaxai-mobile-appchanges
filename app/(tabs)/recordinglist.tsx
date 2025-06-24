@@ -79,6 +79,8 @@ interface Meeting {
   bot_id: number;
   processing_status?: 'processing' | 'completed' | 'failed';
   trascription_status?: string;
+  error_message?: string;
+  summary?: string;
 }
 
 interface GroupedMeeting {
@@ -86,52 +88,116 @@ interface GroupedMeeting {
   meetings: Meeting[];
 }
 
-// Status Badge Component
+// Enhanced Status Badge Component with better logic
 const StatusBadge = ({ meeting }: { meeting: Meeting }) => {
   const getStatusConfig = () => {
-    // Check processing_status first, then fallback to trascription_status
-    const status = meeting.processing_status || meeting.trascription_status;
+    const { processing_status, trascription_status, error_message, summary } = meeting;
     
-    switch (status) {
-      case 'processing':
+    // Priority 1: Check if we have explicit processing_status
+    if (processing_status === 'processing') {
+      return {
+        text: 'Processing...',
+        bgColor: 'rgba(255, 193, 7, 0.2)', // Yellow background
+        textColor: '#FFC107', // Yellow text
+        showSpinner: true
+      };
+    }
+    
+    if (processing_status === 'failed') {
+      return {
+        text: 'Processing Failed',
+        bgColor: 'rgba(231, 76, 60, 0.2)', // Red background
+        textColor: '#E74C3C', // Red text
+        showSpinner: false
+      };
+    }
+    
+    // Priority 2: Check transcription status with additional validation
+    if (trascription_status === 'processing') {
+      return {
+        text: 'Processing...',
+        bgColor: 'rgba(255, 193, 7, 0.2)',
+        textColor: '#FFC107',
+        showSpinner: true
+      };
+    }
+    
+    if (trascription_status === 'failed') {
+      return {
+        text: 'Processing Failed',
+        bgColor: 'rgba(231, 76, 60, 0.2)',
+        textColor: '#E74C3C',
+        showSpinner: false
+      };
+    }
+    
+    // Priority 3: Check if transcription is "success" but validate completion
+    if (trascription_status === 'success') {
+      // Additional validation: check if we actually have content
+      const hasValidContent = summary || (error_message && !error_message.includes('still being processed'));
+      
+      if (hasValidContent) {
+        return {
+          text: 'Process Completed',
+          bgColor: 'rgba(39, 174, 96, 0.2)', // Green background
+          textColor: '#27AE60', // Green text
+          showSpinner: false
+        };
+      } else {
+        // Even though status says "success", we don't have content yet
         return {
           text: 'Processing...',
-          bgColor: 'rgba(255, 193, 7, 0.2)', // Yellow background
-          textColor: '#FFC107', // Yellow text
+          bgColor: 'rgba(255, 193, 7, 0.2)',
+          textColor: '#FFC107',
           showSpinner: true
         };
-      case 'completed':
-        return {
-          text: 'Process Completed',
-          bgColor: 'rgba(39, 174, 96, 0.2)', // Green background
-          textColor: '#27AE60', // Green text
-          showSpinner: false
-        };
-      case 'success':
-        // Only show "Process Completed" for success when it's truly completed
-        // If it's still in the processing pipeline, keep showing "Processing..."
-        return {
-          text: 'Process Completed',
-          bgColor: 'rgba(39, 174, 96, 0.2)', // Green background
-          textColor: '#27AE60', // Green text
-          showSpinner: false
-        };
-      case 'failed':
-        return {
-          text: 'Processing Failed',
-          bgColor: 'rgba(231, 76, 60, 0.2)', // Red background
-          textColor: '#E74C3C', // Red text
-          showSpinner: false
-        };
-      default:
-        // For any undefined status, show as completed (legacy recordings)
+      }
+    }
+    
+    // Priority 4: Check processing_status for completed
+    if (processing_status === 'completed') {
+      // Validate that we actually have content
+      const hasValidContent = summary || (error_message && !error_message.includes('still being processed'));
+      
+      if (hasValidContent) {
         return {
           text: 'Process Completed',
           bgColor: 'rgba(39, 174, 96, 0.2)',
           textColor: '#27AE60',
           showSpinner: false
         };
+      } else {
+        // Status says completed but no content yet
+        return {
+          text: 'Processing...',
+          bgColor: 'rgba(255, 193, 7, 0.2)',
+          textColor: '#FFC107',
+          showSpinner: true
+        };
+      }
     }
+    
+    // Priority 5: Check for error messages indicating processing
+    if (error_message && (
+      error_message.includes('still being processed') || 
+      error_message.includes('large file') ||
+      error_message.includes('processing')
+    )) {
+      return {
+        text: 'Processing...',
+        bgColor: 'rgba(255, 193, 7, 0.2)',
+        textColor: '#FFC107',
+        showSpinner: true
+      };
+    }
+    
+    // Default case: if no clear status, assume completed (for legacy recordings)
+    return {
+      text: 'Process Completed',
+      bgColor: 'rgba(39, 174, 96, 0.2)',
+      textColor: '#27AE60',
+      showSpinner: false
+    };
   };
 
   const config = getStatusConfig();
@@ -323,6 +389,35 @@ export default function RecordingList() {
       );
     },
   });
+
+  // Enhanced function to check if a meeting is truly being processed
+  const isMeetingStillProcessing = (meeting: Meeting): boolean => {
+    const { processing_status, trascription_status, error_message, summary } = meeting;
+    
+    // If explicitly marked as processing
+    if (processing_status === 'processing' || trascription_status === 'processing') {
+      return true;
+    }
+    
+    // If error message indicates processing
+    if (error_message && (
+      error_message.includes('still being processed') || 
+      error_message.includes('large file') ||
+      error_message.includes('processing')
+    )) {
+      return true;
+    }
+    
+    // If status says success/completed but no actual content
+    if ((trascription_status === 'success' || processing_status === 'completed')) {
+      const hasValidContent = summary || (error_message && !error_message.includes('still being processed'));
+      if (!hasValidContent) {
+        return true; // Still processing despite status
+      }
+    }
+    
+    return false;
+  };
   
   // Query for categories with meetings
   const { data: categoriesData, isLoading, isError, refetch } = useQuery({
@@ -339,19 +434,19 @@ export default function RecordingList() {
     },
     enabled: !!userId && isFocused,
     refetchInterval: (query) => {
-      // Auto-refresh every 10 seconds if there are processing recordings
+      // Enhanced auto-refresh logic
       const data = query.state.data;
       if (!data || !Array.isArray(data)) {
-        return false; // No auto-refresh if no data
+        return false;
       }
       
       const hasProcessingRecordings = data.some((category: any) => 
-        category?.meetings?.some((meeting: any) => 
-          meeting?.processing_status === 'processing' || 
-          meeting?.trascription_status === 'processing'
-        )
+        category?.meetings?.some((meeting: any) => {
+          return isMeetingStillProcessing(meeting);
+        })
       );
-      return hasProcessingRecordings ? 10000 : false; // 10 seconds if processing, otherwise no auto-refresh
+      
+      return hasProcessingRecordings ? 8000 : false; // 8 seconds if processing, otherwise no auto-refresh
     }
   });
   
@@ -370,19 +465,19 @@ export default function RecordingList() {
     },
     enabled: !!userId && isFocused,
     refetchInterval: (query) => {
-      // Auto-refresh every 10 seconds if there are processing recordings
+      // Enhanced auto-refresh logic
       const data = query.state.data;
       if (!data || !Array.isArray(data)) {
-        return false; // No auto-refresh if no data
+        return false;
       }
       
       const hasProcessingRecordings = data.some((category: any) => 
-        category?.meetings?.some((meeting: any) => 
-          meeting?.processing_status === 'processing' || 
-          meeting?.trascription_status === 'processing'
-        )
+        category?.meetings?.some((meeting: any) => {
+          return isMeetingStillProcessing(meeting);
+        })
       );
-      return hasProcessingRecordings ? 10000 : false; // 10 seconds if processing, otherwise no auto-refresh
+      
+      return hasProcessingRecordings ? 8000 : false; // 8 seconds if processing, otherwise no auto-refresh
     }
   });
   
@@ -426,12 +521,9 @@ export default function RecordingList() {
     setAllMeetings(meetings);
   }, [categoriesData, uncategorizedData]);
   
-  // Check for processing recordings and set up auto-refresh
+  // Enhanced check for processing recordings and set up auto-refresh
   useEffect(() => {
-    const hasProcessingRecordings = allMeetings.some(meeting => 
-      meeting.processing_status === 'processing' || 
-      meeting.trascription_status === 'processing'
-    );
+    const hasProcessingRecordings = allMeetings.some(meeting => isMeetingStillProcessing(meeting));
 
     if (hasProcessingRecordings && !autoRefreshIntervalRef.current) {
       // Set up auto-refresh for processing recordings
@@ -439,7 +531,7 @@ export default function RecordingList() {
       autoRefreshIntervalRef.current = setInterval(() => {
         console.log('Auto-refreshing due to processing recordings');
         refetch();
-      }, 15000); // Refresh every 15 seconds
+      }, 12000); // Refresh every 12 seconds
     } else if (!hasProcessingRecordings && autoRefreshIntervalRef.current) {
       // Clear auto-refresh when no processing recordings
       console.log('Clearing auto-refresh - no processing recordings');
@@ -596,6 +688,53 @@ export default function RecordingList() {
         {Math.random() > 0.7 && (
           <Text style={styles.noParticipants}>No participants</Text>
         )}
+      </TouchableOpacity>
+    );
+  };
+
+  // Move the HorizontalMeetingCard component definition before it's used
+  const HorizontalMeetingCard = ({ meeting, username, onDeleteMeeting, onShowMenu }: { meeting: Meeting, username: string | undefined, onDeleteMeeting: (eventId: string, e?: any) => void, onShowMenu: (meeting: Meeting, x: number, y: number, e?: any) => void }) => {
+    return (
+      <TouchableOpacity 
+        style={styles.horizontalCard}
+        onPress={() => router.push(`/recordingview?eventID=${meeting.event_id}`)}
+      >
+        <View style={styles.recordingHeader}>
+          <Text style={styles.recordingTitle} numberOfLines={1}>
+            {meeting.meeting_title || `Recording ${meeting.id}`}
+          </Text>
+          <View style={{flexDirection: 'row', alignItems: 'center'}}>
+            <StatusBadge meeting={meeting} />
+            <TouchableOpacity 
+              style={styles.menuButton}
+              onPress={(e) => {
+                const { pageX, pageY } = e.nativeEvent;
+                onShowMenu(meeting, pageX, pageY, e);
+              }}
+            >
+              <Entypo name="dots-three-vertical" size={20} color="#BBBBBB" />
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <Text style={styles.dateText}>
+          {getDateDisplay(meeting.meeting_date)} • {formatTime(meeting.meeting_start_time, meeting.meeting_date)}
+        </Text>
+        
+        <View style={styles.recordingInfo}>
+          <MaterialIcons name="file-upload" size={16} color="#BBBBBB" />
+          <Text style={styles.recordingInfoText}>Recorded or Uploaded meeting</Text>
+        </View>
+
+        <View style={styles.divider} />
+
+        <View style={styles.profileContainer}>
+          <View style={styles.profileIcon}>
+            <Text style={styles.profileText}>
+              {username ? username.substring(0, 2).toUpperCase() : "US"} 
+            </Text>
+          </View>
+        </View>
       </TouchableOpacity>
     );
   };
@@ -1119,50 +1258,3 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 });
-
-// Move the HorizontalMeetingCard component definition before it's used
-const HorizontalMeetingCard = ({ meeting, username, onDeleteMeeting, onShowMenu }: { meeting: Meeting, username: string | undefined, onDeleteMeeting: (eventId: string, e?: any) => void, onShowMenu: (meeting: Meeting, x: number, y: number, e?: any) => void }) => {
-  return (
-    <TouchableOpacity 
-      style={styles.horizontalCard}
-      onPress={() => router.push(`/recordingview?eventID=${meeting.event_id}`)}
-    >
-      <View style={styles.recordingHeader}>
-        <Text style={styles.recordingTitle} numberOfLines={1}>
-          {meeting.meeting_title || `Recording ${meeting.id}`}
-        </Text>
-        <View style={{flexDirection: 'row', alignItems: 'center'}}>
-          <StatusBadge meeting={meeting} />
-          <TouchableOpacity 
-            style={styles.menuButton}
-            onPress={(e) => {
-              const { pageX, pageY } = e.nativeEvent;
-              onShowMenu(meeting, pageX, pageY, e);
-            }}
-          >
-            <Entypo name="dots-three-vertical" size={20} color="#BBBBBB" />
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      <Text style={styles.dateText}>
-        {getDateDisplay(meeting.meeting_date)} • {formatTime(meeting.meeting_start_time, meeting.meeting_date)}
-      </Text>
-      
-      <View style={styles.recordingInfo}>
-        <MaterialIcons name="file-upload" size={16} color="#BBBBBB" />
-        <Text style={styles.recordingInfoText}>Recorded or Uploaded meeting</Text>
-      </View>
-
-      <View style={styles.divider} />
-
-      <View style={styles.profileContainer}>
-        <View style={styles.profileIcon}>
-          <Text style={styles.profileText}>
-            {username ? username.substring(0, 2).toUpperCase() : "US"} 
-          </Text>
-        </View>
-      </View>
-    </TouchableOpacity>
-  );
-};
