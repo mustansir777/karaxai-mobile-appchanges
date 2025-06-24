@@ -24,13 +24,39 @@ import FontAwesome from "@expo/vector-icons/FontAwesome";
 
 const axiosWithoutAuth = axios.create();
 
+// Streaming upload configuration
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+const MAX_CONCURRENT_CHUNKS = 3; // Upload 3 chunks simultaneously
+const RETRY_ATTEMPTS = 3;
+const RETRY_DELAY = 2000; // 2 seconds
+
+// Upload interfaces
+interface StreamingUploadProgress {
+  uploadedBytes: number;
+  totalBytes: number;
+  currentChunk: number;
+  totalChunks: number;
+  percentage: number;
+}
+
 export default function RecordingScreen() {
   const networkState = useNetworkState();
   const [showRetry, setShowRetry] = useState(false);
   const recordUriRef = useRef<string>("");
   const scaleAnim = useRef(new Animated.Value(1)).current;
   const queryClient = useQueryClient();
-  const pathname = usePathname(); // Add this to get current route
+  const pathname = usePathname();
+  
+  // Streaming upload state
+  const [uploadProgress, setUploadProgress] = useState<StreamingUploadProgress>({
+    uploadedBytes: 0,
+    totalBytes: 0,
+    currentChunk: 0,
+    totalChunks: 0,
+    percentage: 0
+  });
+  const [isStreamingUpload, setIsStreamingUpload] = useState(false);
+  const uploadAbortControllerRef = useRef<AbortController | null>(null);
   
   const {
     startRecording,
@@ -44,8 +70,7 @@ export default function RecordingScreen() {
     isRecordingStopping,
   } = useRecording({ scaleAnim: scaleAnim });
 
-  const [isFectingRecordingDetails, setIsFectingRecordingDetails] =
-    useState(false);
+  const [isFectingRecordingDetails, setIsFectingRecordingDetails] = useState(false);
 
   const eventIdRef = useRef("");
   const [eventId, _setEventId] = useState("");
@@ -55,6 +80,153 @@ export default function RecordingScreen() {
   };
 
   const cancelTokenRef = useRef<CancelTokenSource | null>(null);
+
+  // FIXED: Simplified upload method using the working pattern from reference code
+  const uploadRecordingMutation = useMutation({
+    mutationKey: ["uploadRecording"],
+    mutationFn: async () => {
+      const response = await axiosApi({
+        url: "/generate-presigned-url/",
+        method: "POST",
+        params: {
+          only_pre_signed_url: 1,
+        },
+      }).then((res) => res.data);
+      return response;
+    },
+  });
+
+  // FIXED: Upload to S3 using the working pattern from reference code
+  const uploadRecordToS3 = useMutation({
+    mutationKey: ["uploadRecordToS3"],
+    mutationFn: async (payload: { url: string; file: Blob }) => {
+      cancelTokenRef.current = axios.CancelToken.source();
+      const response = await axiosWithoutAuth
+        .put(payload.url, payload.file, {
+          headers: {
+            "Content-Type": "audio/*",
+          },
+          cancelToken: cancelTokenRef.current.token,
+          transformRequest: (data) => {
+            return data;
+          },
+          timeout: 300000, // 5 minutes timeout for large files
+          onUploadProgress: (progressEvent) => {
+            const percentCompleted = Math.round(
+              (progressEvent.loaded * 100) / (progressEvent.total || 1)
+            );
+            console.log(`Upload progress: ${percentCompleted}%`);
+            
+            // Update progress state for UI
+            setUploadProgress(prev => ({
+              ...prev,
+              uploadedBytes: progressEvent.loaded,
+              totalBytes: progressEvent.total || 0,
+              percentage: percentCompleted
+            }));
+          },
+        })
+        .then((res) => res.data);
+      return response;
+    },
+  });
+
+  // FIXED: Alternative streaming upload method with better error handling
+  const streamingUploadToS3 = async (uri: string, filename: string): Promise<{ success: boolean, fileUrl?: string, filePath?: string }> => {
+    try {
+      setIsStreamingUpload(true);
+      uploadAbortControllerRef.current = new AbortController();
+      
+      // Step 1: Get file info and check size
+      Toast.show("Preparing file for upload...", Toast.SHORT, "top", "info");
+      const fileResponse = await fetch(uri);
+      const blob = await fileResponse.blob();
+      const totalSize = blob.size;
+      
+      console.log(`File size: ${(totalSize / 1024 / 1024).toFixed(2)} MB`);
+      
+      setUploadProgress({
+        uploadedBytes: 0,
+        totalBytes: totalSize,
+        currentChunk: 0,
+        totalChunks: 1,
+        percentage: 0
+      });
+      
+      // Step 2: Get presigned URL using the working method
+      Toast.show("Getting upload URL...", Toast.SHORT, "top", "info");
+      const uploadUrlResponse = await uploadRecordingMutation.mutateAsync();
+      
+      if (!uploadUrlResponse.success) {
+        throw new Error(uploadUrlResponse.message || 'Failed to get upload URL');
+      }
+      
+      const uploadUrl = uploadUrlResponse.data.url;
+      const filePath = uploadUrlResponse.data.file_path;
+      
+      console.log('Upload URL obtained successfully');
+      
+      // Step 3: Upload file using fetch (simpler and more reliable than axios for large files)
+      Toast.show("Uploading file...", Toast.SHORT, "top", "info");
+      
+      const response = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: {
+          "Content-Type": "audio/*",
+        },
+        body: blob,
+        signal: uploadAbortControllerRef.current?.signal,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unable to read error response');
+        console.error('Upload failed:', response.status, response.statusText, errorText);
+        throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
+      }
+      
+      console.log('Upload successful');
+      
+      // Update progress to 100%
+      setUploadProgress(prev => ({
+        ...prev,
+        uploadedBytes: totalSize,
+        percentage: 100
+      }));
+      
+      return {
+        success: true,
+        fileUrl: uploadUrl.split('?')[0], // Remove query parameters to get clean URL
+        filePath: filePath
+      };
+      
+    } catch (error) {
+      console.error('Streaming upload error:', error);
+      
+      const typedError = error as Error;
+      if (typedError.name === 'AbortError') {
+        throw new Error('Upload cancelled by user');
+      }
+      
+      throw error;
+    } finally {
+      setIsStreamingUpload(false);
+      uploadAbortControllerRef.current = null;
+    }
+  };
+
+  // Cancel upload function
+  const cancelUpload = () => {
+    if (cancelTokenRef.current) {
+      cancelTokenRef.current.cancel("Upload cancelled by the user");
+      setEventId("");
+      setShowRetry(false);
+    }
+    if (uploadAbortControllerRef.current) {
+      uploadAbortControllerRef.current.abort();
+      Toast.show("Upload cancelled", Toast.SHORT, "top", "info");
+      setShowRetry(true);
+    }
+  };
 
   // Helper function to update recording status in cache
   const updateRecordingStatusInCache = (eventId: string, status: 'processing' | 'completed' | 'failed') => {
@@ -169,68 +341,19 @@ export default function RecordingScreen() {
         url: "/process-audio/",
         method: "POST",
         data: payload,
-        // Add timeout for large files processing request
         timeout: 600000, // 10 minutes timeout for processing request
       }).then((res) => res.data);
       return response;
     },
-    retry: 2, // Add retry at the mutation level
-    retryDelay: 10000, // 10 seconds between retries
-  });
-
-  const uploadRecordingMutation = useMutation({
-    mutationKey: ["uploadRecording"],
-    mutationFn: async () => {
-      const response = await axiosApi({
-        url: "/generate-presigned-url/",
-        method: "POST",
-        params: {
-          only_pre_signed_url: 1,
-        },
-      }).then((res) => res.data);
-      return response;
-    },
-  });
-
-  const uploadRecordToS3 = useMutation({
-    mutationKey: ["uploadRecordToS3"],
-    mutationFn: async (payload: { url: string; file: Blob }) => {
-      cancelTokenRef.current = axios.CancelToken.source();
-      const response = await axiosWithoutAuth
-        .put(payload.url, payload.file, {
-          headers: {
-            "Content-Type": "audio/*",
-          },
-          cancelToken: cancelTokenRef.current.token,
-          transformRequest: (data) => {
-            return data;
-          },
-          // Add timeout and increase it for large files
-          timeout: 300000, // 5 minutes timeout for large files
-          // Add onUploadProgress to track upload progress
-          onUploadProgress: (progressEvent) => {
-            const percentCompleted = Math.round(
-              (progressEvent.loaded * 100) / (progressEvent.total || 1)
-            );
-            console.log(`Upload progress: ${percentCompleted}%`);
-          },
-        })
-        .then((res) => res.data);
-      return response;
-    },
+    retry: 2,
+    retryDelay: 10000,
   });
 
   // Track polling attempts for recording details
   const pollingAttemptsRef = useRef(0);
-  // For large recordings (30+ minutes), we need to poll for a longer time
-  // 60 attempts * 15 seconds = 15 minutes max polling time
   const maxPollingAttempts = 60;
-  const pollingInterval = 15000; // 15 seconds between polls for large files
-  
-  // Track if we're dealing with a large file
+  const pollingInterval = 15000;
   const isLargeFileRef = useRef(false);
-  
-  // Set this flag when we detect the recording is being processed
   const isProcessingDetectedRef = useRef(false);
   
   const recordingDetailsViewApi = useQuery({
@@ -241,41 +364,26 @@ export default function RecordingScreen() {
       
       console.log(`Polling attempt ${pollingAttemptsRef.current}/${maxPollingAttempts} for event ID: ${eventID}`);
       
-      // Implement exponential backoff for polling
-      const getPollingBackoff = () => {
-        // Start with normal interval, then increase if we detect it's a large file
-        if (isLargeFileRef.current && pollingAttemptsRef.current > 10) {
-          // After 10 attempts with a large file, increase polling interval
-          return pollingInterval * 1.5;
-        }
-        return pollingInterval;
-      };
-      
       try {
         const response = await axiosApi({
           url: makeUrlWithParams("/meeting-view/{{eventId}}/", {
             eventId: eventID,
           }),
           method: "GET",
-          // Add timeout for the polling request
-          timeout: 30000, // 30 seconds timeout for polling
+          timeout: 30000,
         });
         
         const data = response.data;
         
-        // Check if the response indicates this is a large file being processed
         if (data.error_message && 
             (data.error_message.includes('still being processed') || 
              data.error_message.includes('large file'))) {
           isLargeFileRef.current = true;
           isProcessingDetectedRef.current = true;
           console.log('Detected large file being processed');
-          
-          // Update status to processing in the UI
           updateRecordingStatusInCache(eventID, 'processing');
         }
         
-        // Check if processing is complete (success or failure)
         if (
           (data.trascription_status == "success" ||
             data.trascription_status == "failed") &&
@@ -287,15 +395,12 @@ export default function RecordingScreen() {
             .slice(0, 19);
           console.log('Processing completed:', data.trascription_status);
           
-          // Reset polling counter
           pollingAttemptsRef.current = 0;
           isLargeFileRef.current = false;
           isProcessingDetectedRef.current = false;
           
-          // Save recording first
           await saveRecording(data, eventID, date);
           
-          // Only update status to completed AFTER successful save and success message
           const finalStatus = data.trascription_status === "success" ? 'completed' : 'failed';
           updateRecordingStatusInCache(eventID, finalStatus);
           
@@ -305,8 +410,6 @@ export default function RecordingScreen() {
             Toast.show("Processing completed with issues. Check details.", Toast.SHORT, "top", "info");
           }
           
-          // Only navigate if user is still on the recording screen
-          // If they're already on the recording list, the status will update automatically
           if (pathname && pathname.includes('recording') && !pathname.includes('recordinglist')) {
             router.push(`/recordingview?eventID=${eventID}`);
           }
@@ -314,10 +417,8 @@ export default function RecordingScreen() {
           setEventId("");
           setIsFectingRecordingDetails(false);
         } else if (pollingAttemptsRef.current >= maxPollingAttempts) {
-          // If we've reached max polling attempts but processing isn't complete
           console.log('Maximum polling attempts reached, saving event ID for later');
           
-          // Update status to failed in cache
           updateRecordingStatusInCache(eventID, 'failed');
           
           Toast.show(
@@ -327,26 +428,20 @@ export default function RecordingScreen() {
             "info"
           );
           
-          // Save the event ID for later checking
           await AsyncStorage.setItem("pending_recording_event_id", eventID);
           await AsyncStorage.setItem("pending_recording_timestamp", new Date().toISOString());
           
-          // Reset polling counter
           pollingAttemptsRef.current = 0;
           setEventId("");
           setIsFectingRecordingDetails(false);
           
-          // Navigate to recordings list or home
           router.back();
         } else if (pollingAttemptsRef.current % 3 === 0 || 
                   (isLargeFileRef.current && pollingAttemptsRef.current % 2 === 0)) {
-          // Show status updates more frequently for large files
           const percentage = Math.round((pollingAttemptsRef.current / maxPollingAttempts) * 100);
           
-          // Update processing status in cache during polling
           updateRecordingStatusInCache(eventID, 'processing');
           
-          // For large files, provide more detailed status messages
           if (isLargeFileRef.current) {
             Toast.show(
               `Processing large recording... (${percentage}%) This may take several minutes.`,
@@ -368,14 +463,12 @@ export default function RecordingScreen() {
       } catch (error) {
         console.error('Error polling recording details:', error);
         
-        // Check for specific error types
         const typedError = error as any;
         const isNetworkError = typedError.message?.includes('network') || 
                               typedError.message?.includes('timeout') || 
                               typedError.status === 503 || 
                               typedError.status === 504;
         
-        // For network errors, we should continue polling
         if (isNetworkError) {
           console.log('Network error during polling, will continue polling');
           Toast.show(
@@ -386,65 +479,49 @@ export default function RecordingScreen() {
           );
         } else {
           Toast.show(
-            (error as any).message?.message || "Error getting recording details",
+            typedError.message?.message || "Error getting recording details",
             Toast.SHORT,
             "top",
             "error"
           );
         }
         
-        // If we've had too many consecutive errors, stop polling
-        // But be more lenient with large files
         const maxConsecutiveErrors = isLargeFileRef.current ? 10 : 5;
         
         if (pollingAttemptsRef.current >= maxConsecutiveErrors && !isProcessingDetectedRef.current) {
           console.log('Too many consecutive errors, stopping polling');
-          // Update status to failed in cache
           updateRecordingStatusInCache(eventIdRef.current, 'failed');
           setIsFectingRecordingDetails(false);
           setEventId("");
           pollingAttemptsRef.current = 0;
         }
         
-        return { error: (error as any).message };
+        return { error: typedError.message };
       }
     },
     enabled: !!eventId,
     refetchInterval: pollingInterval,
     retry: 3,
-    retryDelay: (attemptIndex) => Math.min(1000 * Math.pow(2, attemptIndex), 10000), // Exponential backoff for retries
+    retryDelay: (attemptIndex) => Math.min(1000 * Math.pow(2, attemptIndex), 10000),
   });
-
-  const cancelUpload = () => {
-    if (cancelTokenRef.current) {
-      cancelTokenRef.current.cancel("Upload cancelled by the user");
-      setEventId("");
-      setShowRetry(false);
-    }
-  };
 
   // Track processing attempts
   const processingAttemptsRef = useRef(0);
-  const maxProcessingAttempts = 10; // Increased from 3 to 10 for large files
+  const maxProcessingAttempts = 10;
   
   const handleProccessRecording = (payload: ProccessAudio) => {
-    // Reset attempts counter when starting a new processing request
     processingAttemptsRef.current = 0;
     
-    // Calculate retry delay based on attempt number (exponential backoff)
     const getRetryDelay = (attempt: number) => {
-      // Start with 10 seconds, then 20, 40, etc. (capped at 2 minutes)
       return Math.min(10000 * Math.pow(2, attempt - 1), 120000);
     };
     
     const attemptProcessing = () => {
       processingAttemptsRef.current += 1;
       
-      // For large files, we need to be more patient with processing
       const isLargeFile = payload.file_path.includes('large') || 
                          (payload.meeting_title || '').toLowerCase().includes('large');
       
-      // Show different messages based on attempt number
       if (processingAttemptsRef.current === 1) {
         Toast.show(
           `Starting audio processing...`,
@@ -468,12 +545,11 @@ export default function RecordingScreen() {
         .then((e) => {
           console.log('Processing response:', e);
           if (e.success) {
-            processingAttemptsRef.current = 0; // Reset counter on success
+            processingAttemptsRef.current = 0;
             const currentEventId = e.data.event_id;
             setEventId(currentEventId);
             setIsFectingRecordingDetails(true);
             
-            // Add new recording to cache with processing status immediately
             const currentDate = new Date().toISOString().replace("T", " ").slice(0, 19);
             addNewRecordingToCache(currentEventId, payload.meeting_title, currentDate);
             
@@ -484,19 +560,13 @@ export default function RecordingScreen() {
               "success"
             );
 
-            // Redirect to recording list immediately after processing starts
-            // This allows user to see the "Processing..." status in the list
             setTimeout(() => {
               router.push('/(tabs)/recordinglist');
-            }, 1000); // Small delay to ensure cache is updated and user sees the success message
-
-            // Continue polling in background for status updates
-            // The polling will continue and update the cache automatically
+            }, 1000);
           } else {
             console.error('Processing failed with message:', e.message);
             Toast.show(e.message, Toast.SHORT, "top", "error");
             
-            // Retry logic for processing with exponential backoff
             if (processingAttemptsRef.current < maxProcessingAttempts) {
               const retryDelay = getRetryDelay(processingAttemptsRef.current);
               
@@ -521,30 +591,26 @@ export default function RecordingScreen() {
         .catch((e) => {
           console.error('Processing error:', e);
           
-          // Check if error is related to timeout or server overload
+          const typedError = e as any;
           const isTimeoutOrServerError = 
-            e.message?.includes('timeout') || 
-            e.message?.includes('network') || 
-            e.status === 503 || 
-            e.status === 504;
+            typedError.message?.includes('timeout') || 
+            typedError.message?.includes('network') || 
+            typedError.status === 503 || 
+            typedError.status === 504;
           
-          // For timeout errors, we should definitely retry
           if (isTimeoutOrServerError) {
             console.log('Detected timeout or server error, will retry with longer delay');
           }
           
           Toast.show(
-            e.message?.message || "Processing audio failed",
+            typedError.message?.message || "Processing audio failed",
             Toast.SHORT,
             "top",
             "error"
           );
           
-          // Retry logic for errors with exponential backoff
           if (processingAttemptsRef.current < maxProcessingAttempts) {
             const retryDelay = getRetryDelay(processingAttemptsRef.current);
-            
-            // Use longer delay for timeout errors
             const adjustedDelay = isTimeoutOrServerError ? retryDelay * 2 : retryDelay;
             
             Toast.show(
@@ -566,7 +632,6 @@ export default function RecordingScreen() {
         });
     };
     
-    // Start the first attempt
     attemptProcessing();
   };
 
@@ -574,6 +639,7 @@ export default function RecordingScreen() {
   const LARGE_FILE_THRESHOLD_MB = 50;
   const VERY_LARGE_FILE_THRESHOLD_MB = 100;
   
+  // FIXED: Simplified upload function with fallback to original method
   const handleUpload = async (uri: string) => {
     try {
       if (!networkState.isConnected) {
@@ -603,10 +669,9 @@ export default function RecordingScreen() {
         isLargeFile = fileSizeInMB > LARGE_FILE_THRESHOLD_MB;
         isVeryLargeFile = fileSizeInMB > VERY_LARGE_FILE_THRESHOLD_MB;
         
-        // Warn user if file is large
         if (isVeryLargeFile) {
           Toast.show(
-            `Very large file (${fileSizeInMB.toFixed(2)} MB). Upload and processing may take significantly longer.`,
+            `Very large file (${fileSizeInMB.toFixed(2)} MB). Upload may take longer.`,
             Toast.LONG,
             "top",
             "info"
@@ -623,13 +688,46 @@ export default function RecordingScreen() {
         console.log("Error checking file size:", error);
       }
 
-      // Create a more descriptive filename that includes file size for better server-side handling
       const fileSize = fileSizeInMB > 0 ? `_${fileSizeInMB.toFixed(0)}MB` : '';
       const fileType = isLargeFile ? '_large' : '';
-      
+      const filename = `audio-${date}${fileSize}${fileType}.m4a`;
+
+      // For large files, try streaming upload first, then fallback to original method
+      if (isLargeFile) {
+        try {
+          Toast.show("Starting streaming upload...", Toast.SHORT, "top", "info");
+          const uploadResult = await streamingUploadToS3(uri, filename);
+          
+          if (uploadResult.success) {
+            Toast.show("Upload completed successfully!", Toast.SHORT, "top", "success");
+            
+            let processingDelay = isVeryLargeFile ? 10000 : 5000;
+            
+            setTimeout(() => {
+              Toast.show("Starting audio processing...", Toast.SHORT, "top", "info");
+              
+              const meetingTitle = isLargeFile 
+                ? `recording ${date} (large ${fileSizeInMB.toFixed(0)}MB)` 
+                : `recording ${date}`;
+              
+              handleProccessRecording({
+                file_url: uploadResult.fileUrl!,
+                file_path: uploadResult.filePath!,
+                meeting_title: meetingTitle,
+              });
+            }, processingDelay);
+            return;
+          }
+        } catch (streamError) {
+          console.log("Streaming upload failed, falling back to standard method:", streamError);
+          Toast.show("Streaming upload failed, trying standard upload...", Toast.SHORT, "top", "info");
+        }
+      }
+
+      // Fallback to original upload method (same as reference code)
       const file = {
         uri: uri,
-        name: `audio-${date}${fileSize}${fileType}.m4a`,
+        name: filename,
         type: "audio/*",
       };
 
@@ -649,12 +747,10 @@ export default function RecordingScreen() {
               .then(() => {
                 Toast.show("Uploaded Successfully!", Toast.SHORT, "top", "success");
                 
-                // Calculate appropriate delay based on file size
-                // Larger files need more time for S3 to process
-                let processingDelay = 1000; // Default 1 second
+                let processingDelay = 1000;
                 
                 if (isVeryLargeFile) {
-                  processingDelay = 10000; // 10 seconds for very large files
+                  processingDelay = 10000;
                   Toast.show(
                     "Very large file uploaded. Preparing for processing...",
                     Toast.LONG,
@@ -662,7 +758,7 @@ export default function RecordingScreen() {
                     "info"
                   );
                 } else if (isLargeFile) {
-                  processingDelay = 5000; // 5 seconds for large files
+                  processingDelay = 5000;
                   Toast.show(
                     "Large file uploaded. Preparing for processing...",
                     Toast.SHORT,
@@ -671,12 +767,9 @@ export default function RecordingScreen() {
                   );
                 }
                 
-                // Add a delay before processing to ensure S3 has fully processed the upload
-                // The delay is proportional to the file size
                 setTimeout(() => {
                   Toast.show("Starting audio processing...", Toast.SHORT, "top", "info");
                   
-                  // Create a more descriptive meeting title that includes file size
                   const meetingTitle = isLargeFile 
                     ? `recording ${date} (large ${fileSizeInMB.toFixed(0)}MB)` 
                     : `recording ${date}`;
@@ -694,7 +787,6 @@ export default function RecordingScreen() {
                 } else {
                   console.error("Upload error:", e);
                   
-                  // Provide more specific error messages for common upload issues
                   let errorMessage = "Upload Failed! Please try again.";
                   
                   if (e.message?.includes('timeout')) {
@@ -742,17 +834,12 @@ export default function RecordingScreen() {
     await startRecording();
   };
 
-  // const saveDummpyRecording = () => {
-  //   saveRecording(RecordingDetails, "78d79690-b854-4f6a-a02b-1dba02cd73ac");
-  // };
-
   // Check for pending recordings when component mounts
   useEffect(() => {
     const checkPendingRecordings = async () => {
       try {
         const pendingEventId = await AsyncStorage.getItem("pending_recording_event_id");
         if (pendingEventId) {
-          // Ask user if they want to check the status of the pending recording using Alert
           Alert.alert(
             "Pending Recording Found",
             "You have a recording that was being processed. Do you want to check its status?",
@@ -761,7 +848,6 @@ export default function RecordingScreen() {
                 text: "No",
                 style: "cancel",
                 onPress: async () => {
-                  // Clear the pending recording ID if user doesn't want to check
                   await AsyncStorage.removeItem("pending_recording_event_id");
                   await AsyncStorage.removeItem("pending_recording_timestamp");
                 }
@@ -769,11 +855,8 @@ export default function RecordingScreen() {
               {
                 text: "Yes",
                 onPress: async () => {
-                  // Clear the pending recording ID
                   await AsyncStorage.removeItem("pending_recording_event_id");
                   await AsyncStorage.removeItem("pending_recording_timestamp");
-                  
-                  // Navigate to the recording view
                   router.push(`/recordingview?eventID=${pendingEventId}`);
                 }
               }
@@ -801,10 +884,55 @@ export default function RecordingScreen() {
     }
   }, [isRecording]);
 
-  // console.log("isRecording", isRecording);
   const handleSelectedUploadFile = (url: string) => {
     recordUriRef.current = url;
     handleUpload(url);
+  };
+
+  // Helper function to format bytes
+  const formatBytes = (bytes: number): string => {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  // Render upload progress
+  const renderUploadProgress = () => {
+    if (!isStreamingUpload && !uploadRecordToS3.isPending) return null;
+    
+    return (
+      <View className="bg-[#0F0F0F] rounded-xl p-6 mx-4 mb-4">
+        <Text className="text-white text-lg font-semibold mb-2">
+          {isStreamingUpload ? "Streaming Upload Progress" : "Upload Progress"}
+        </Text>
+        
+        <View className="bg-gray-700 rounded-full h-2 mb-2">
+          <View 
+            className="bg-blue-500 h-2 rounded-full" 
+            style={{ width: `${uploadProgress.percentage}%` }}
+          />
+        </View>
+        
+        <Text className="text-gray-300 text-sm mb-1">
+          {uploadProgress.percentage}% • {formatBytes(uploadProgress.uploadedBytes)} / {formatBytes(uploadProgress.totalBytes)}
+        </Text>
+        
+        {isStreamingUpload && uploadProgress.totalChunks > 1 && (
+          <Text className="text-gray-400 text-xs">
+            Chunk {uploadProgress.currentChunk} of {uploadProgress.totalChunks}
+          </Text>
+        )}
+        
+        <CustomButton
+          onPress={cancelUpload}
+          type="secondary"
+          className="px-4 py-2 rounded-lg mt-3"
+          title="Cancel Upload"
+        />
+      </View>
+    );
   };
 
   return (
@@ -812,6 +940,7 @@ export default function RecordingScreen() {
       {uploadRecordingMutation.isPending ||
       proccessRecordingMutation.isPending ||
       uploadRecordToS3.isPending ||
+      isStreamingUpload ||
       isFectingRecordingDetails ? (
         <View className="flex-1 items-center justify-center px-12">
           <View className="bg-[#0F0F0F] rounded-xl p-12">
@@ -823,26 +952,24 @@ export default function RecordingScreen() {
               minimumFontScale={0.8}
             >
               {uploadRecordingMutation.isPending
-                ? "Preparing.."
+                ? "Preparing upload..."
                 : proccessRecordingMutation.isPending
                 ? "Processing the audio file. please wait..."
                 : isFectingRecordingDetails
                 ? "Processing the audio file. please wait..."
+                : isStreamingUpload
+                ? "Streaming upload in progress..."
                 : uploadRecordToS3.isPending
                 ? "Uploading your recording..."
                 : ""}
             </Text>
-            <ActivityIndicator size="large" color="#004aad" />
-
-            {uploadRecordToS3.isPending && (
-              <CustomButton
-                onPress={cancelUpload}
-                type="secondary"
-                className="px-4 py-2 rounded-lg mt-4"
-                title="Cancel upload"
-              />
+            
+            {!(isStreamingUpload || uploadRecordToS3.isPending) && (
+              <ActivityIndicator size="large" color="#004aad" />
             )}
           </View>
+          
+          {renderUploadProgress()}
         </View>
       ) : (
         <View className="flex-1 items-center justify-center px-12">
@@ -877,7 +1004,7 @@ export default function RecordingScreen() {
           {showRetry && (
             <CustomButton
               title="Retry Upload"
-              disabled={uploadRecordingMutation.isPending}
+              disabled={isStreamingUpload || uploadRecordingMutation.isPending}
               onPress={async () => {
                 await handleUpload(recordUriRef.current);
               }}
@@ -911,13 +1038,6 @@ export default function RecordingScreen() {
               <UploadRecord onUpload={handleSelectedUploadFile} />
             </View>
           )}
-
-          {/* <CustomButton
-            onPress={saveDummpyRecording}
-            type="secondary"
-            className="p-4 rounded-full"
-            title="Save Dummy Recording"
-          /> */}
         </View>
       )}
     </ThemeView>
