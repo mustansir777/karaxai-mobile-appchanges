@@ -105,7 +105,7 @@ export default function ProfileScreen() {
 
           <CustomButton
             onPress={() => {
-              router.push("/support");
+              router.push("https://karax.ai/contact");
             }}
             title="Support"
             type="primary"
