@@ -77,6 +77,7 @@ interface Meeting {
   organizer_email: string;
   source: string;
   bot_id: number;
+  status?: string; // Added status field from /list-meetings API
   processing_status?: 'processing' | 'completed' | 'failed';
   trascription_status?: string;
   error_message?: string;
@@ -91,7 +92,38 @@ interface GroupedMeeting {
 // Enhanced Status Badge Component with better logic
 const StatusBadge = ({ meeting }: { meeting: Meeting }) => {
   const getStatusConfig = () => {
-    const { processing_status, trascription_status, error_message, summary } = meeting;
+    const { status, processing_status, trascription_status, error_message, summary } = meeting;
+    
+    // Priority 0: Check the status field from the API response
+    if (status) {
+      if (status === 'Processing') {
+        return {
+          text: 'Processing...',
+          bgColor: 'rgba(255, 193, 7, 0.2)', // Yellow background
+          textColor: '#FFC107', // Yellow text
+          showSpinner: true
+        };
+      }
+      
+      if (status === 'Processing Failed' || status === 'Bot Error') {
+        return {
+          text: status,
+          bgColor: 'rgba(231, 76, 60, 0.2)', // Red background
+          textColor: '#E74C3C', // Red text
+          showSpinner: false
+        };
+      }
+      
+      if (status === 'Process Completed') {
+        // Trust the API status directly without checking for summary
+        return {
+          text: status,
+          bgColor: 'rgba(39, 174, 96, 0.2)', // Green background
+          textColor: '#27AE60', // Green text
+          showSpinner: false
+        };
+      }
+    }
     
     // Priority 1: Check if we have explicit processing_status
     if (processing_status === 'processing') {
@@ -126,17 +158,15 @@ const StatusBadge = ({ meeting }: { meeting: Meeting }) => {
       return {
         text: 'Processing Failed',
         bgColor: 'rgba(231, 76, 60, 0.2)',
-        textColor: '#E74C3C',
+        textColor: '#E74C3C', // Red text
         showSpinner: false
       };
     }
     
     // Priority 3: Check if transcription is "success" but validate completion
     if (trascription_status === 'success') {
-      // Additional validation: check if we actually have content
-      const hasValidContent = summary || (error_message && !error_message.includes('still being processed'));
-      
-      if (hasValidContent) {
+      // Only show as completed if summary is available
+      if (summary) {
         return {
           text: 'Process Completed',
           bgColor: 'rgba(39, 174, 96, 0.2)', // Green background
@@ -144,7 +174,7 @@ const StatusBadge = ({ meeting }: { meeting: Meeting }) => {
           showSpinner: false
         };
       } else {
-        // Even though status says "success", we don't have content yet
+        // Even though status says "success", we don't have summary yet
         return {
           text: 'Processing...',
           bgColor: 'rgba(255, 193, 7, 0.2)',
@@ -156,10 +186,8 @@ const StatusBadge = ({ meeting }: { meeting: Meeting }) => {
     
     // Priority 4: Check processing_status for completed
     if (processing_status === 'completed') {
-      // Validate that we actually have content
-      const hasValidContent = summary || (error_message && !error_message.includes('still being processed'));
-      
-      if (hasValidContent) {
+      // Only show as completed if summary is available
+      if (summary) {
         return {
           text: 'Process Completed',
           bgColor: 'rgba(39, 174, 96, 0.2)',
@@ -167,7 +195,7 @@ const StatusBadge = ({ meeting }: { meeting: Meeting }) => {
           showSpinner: false
         };
       } else {
-        // Status says completed but no content yet
+        // Status says completed but no summary yet
         return {
           text: 'Processing...',
           bgColor: 'rgba(255, 193, 7, 0.2)',
@@ -191,13 +219,32 @@ const StatusBadge = ({ meeting }: { meeting: Meeting }) => {
       };
     }
     
-    // Default case: if no clear status, assume completed (for legacy recordings)
-    return {
-      text: 'Process Completed',
-      bgColor: 'rgba(39, 174, 96, 0.2)',
-      textColor: '#27AE60',
-      showSpinner: false
-    };
+    // Default case for legacy recordings: show as completed
+    // For older recordings that don't have summary field but are already processed
+    const isLegacyRecording = !summary && !error_message && !processing_status && !trascription_status;
+    
+    if (isLegacyRecording) {
+      return {
+        text: 'Process Completed',
+        bgColor: 'rgba(39, 174, 96, 0.2)',
+        textColor: '#27AE60',
+        showSpinner: false
+      };
+    } else if (summary) {
+      return {
+        text: 'Process Completed',
+        bgColor: 'rgba(39, 174, 96, 0.2)',
+        textColor: '#27AE60',
+        showSpinner: false
+      };
+    } else {
+      return {
+        text: 'Processing...',
+        bgColor: 'rgba(255, 193, 7, 0.2)',
+        textColor: '#FFC107',
+        showSpinner: true
+      };
+    }
   };
 
   const config = getStatusConfig();
@@ -392,7 +439,16 @@ export default function RecordingList() {
 
   // Enhanced function to check if a meeting is truly being processed
   const isMeetingStillProcessing = (meeting: Meeting): boolean => {
-    const { processing_status, trascription_status, error_message, summary } = meeting;
+    const { processing_status, trascription_status, error_message, summary, status } = meeting;
+    
+    // Priority 0: Check status field from API response
+    if (status === 'Processing') {
+      return true;
+    }
+    
+    if (status === 'Process Completed') {
+      return false; // Trust the API status directly
+    }
     
     // If explicitly marked as processing
     if (processing_status === 'processing' || trascription_status === 'processing') {
@@ -408,12 +464,9 @@ export default function RecordingList() {
       return true;
     }
     
-    // If status says success/completed but no actual content
-    if ((trascription_status === 'success' || processing_status === 'completed')) {
-      const hasValidContent = summary || (error_message && !error_message.includes('still being processed'));
-      if (!hasValidContent) {
-        return true; // Still processing despite status
-      }
+    // If transcription is successful but summary is not available, consider it still processing
+    if ((trascription_status === 'success' || processing_status === 'completed') && !summary) {
+      return true; // Still processing despite status
     }
     
     return false;
