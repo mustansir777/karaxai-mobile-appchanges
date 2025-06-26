@@ -131,6 +131,59 @@ export default function RecordingScreen() {
     },
   });
 
+  // Direct upload for small files (under 10MB) - faster processing
+  const directUploadForSmallFiles = async (uri: string, filename: string): Promise<{ success: boolean, fileUrl?: string, filePath?: string }> => {
+    try {
+      Toast.show("Preparing small file for direct upload...", Toast.SHORT, "top", "info");
+      
+      // Get file as blob
+      const fileResponse = await fetch(uri);
+      const blob = await fileResponse.blob();
+      
+      console.log(`Small file loaded: ${(blob.size / 1024 / 1024).toFixed(2)} MB`);
+      
+      // Get presigned URL
+      Toast.show("Getting upload URL...", Toast.SHORT, "top", "info");
+      const uploadUrlResponse = await uploadRecordingMutation.mutateAsync();
+      
+      if (!uploadUrlResponse.success) {
+        throw new Error(uploadUrlResponse.message || 'Failed to get upload URL');
+      }
+      
+      const uploadUrl = uploadUrlResponse.data.url;
+      const filePath = uploadUrlResponse.data.file_path;
+      
+      // Upload blob directly with optimized settings for small files
+      Toast.show("Fast-tracking small file upload...", Toast.SHORT, "top", "info");
+      
+      const response = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: {
+          "Content-Type": "audio/*",
+        },
+        body: blob
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unable to read error response');
+        console.error('Direct upload failed:', response.status, response.statusText, errorText);
+        throw new Error(`Direct upload failed: ${response.status} ${response.statusText}`);
+      }
+      
+      console.log('Small file upload successful');
+      
+      return {
+        success: true,
+        fileUrl: uploadUrl.split('?')[0], // Remove query parameters to get clean URL
+        filePath: filePath
+      };
+      
+    } catch (error) {
+      console.error('Small file upload error:', error);
+      throw error;
+    }
+  };
+
   // FIXED: Alternative streaming upload method with better error handling
   const streamingUploadToS3 = async (uri: string, filename: string): Promise<{ success: boolean, fileUrl?: string, filePath?: string }> => {
     try {
@@ -230,6 +283,11 @@ export default function RecordingScreen() {
 
   // Helper function to update recording status in cache
   const updateRecordingStatusInCache = (eventId: string, status: 'processing' | 'completed' | 'failed') => {
+    // Map internal status to API status format
+    const apiStatus = status === 'processing' ? 'Processing' : 
+                      status === 'completed' ? 'Process Completed' : 
+                      'Processing Failed';
+    
     // Update categoriesWithMeetings cache
     queryClient.setQueryData(['categoriesWithMeetings'], (oldData: any) => {
       if (!oldData) return oldData;
@@ -244,6 +302,7 @@ export default function RecordingScreen() {
                 if (meeting.event_id === eventId) {
                   return {
                     ...meeting,
+                    status: apiStatus, // Add API status field
                     processing_status: status,
                     trascription_status: status === 'completed' ? 'success' : status === 'failed' ? 'failed' : 'processing'
                   };
@@ -272,6 +331,7 @@ export default function RecordingScreen() {
                 if (meeting.event_id === eventId) {
                   return {
                     ...meeting,
+                    status: apiStatus, // Add API status field
                     processing_status: status,
                     trascription_status: status === 'completed' ? 'success' : status === 'failed' ? 'failed' : 'processing'
                   };
@@ -300,6 +360,7 @@ export default function RecordingScreen() {
       meeting_date: date.split(' ')[0], // Extract date part
       meeting_start_time: date.split(' ')[1] || '00:00:00', // Extract time part
       meeting_end_time: date.split(' ')[1] || '00:00:00',
+      status: 'Processing', // Add API status field
       processing_status: 'processing',
       trascription_status: 'processing',
       categoryId: 0,
@@ -352,9 +413,35 @@ export default function RecordingScreen() {
   // Track polling attempts for recording details
   const pollingAttemptsRef = useRef(0);
   const maxPollingAttempts = 60;
-  const pollingInterval = 15000;
+  // Dynamic polling interval based on file size
+  const [pollingInterval, setPollingInterval] = useState(15000); // Default 15 seconds
+  const [fileSize, setFileSize] = useState(0);
+  
+  // Set polling interval based on file size
+  const getPollingInterval = (fileSize: number) => {
+    if (fileSize > VERY_LARGE_FILE_THRESHOLD_MB) {
+      return 30000; // 30 seconds for very large files
+    } else if (fileSize > LARGE_FILE_THRESHOLD_MB) {
+      return 15000; // 15 seconds for large files
+    } else if (fileSize <= SMALL_FILE_THRESHOLD_MB) {
+      return 3000; // 3 seconds for small files (optimized processing)
+    } else {
+      return 5000; // 5 seconds for medium-sized files
+    }
+  };
   const isLargeFileRef = useRef(false);
   const isProcessingDetectedRef = useRef(false);
+  
+  // Update polling interval when file size changes
+  useEffect(() => {
+    const interval = getPollingInterval(fileSize);
+    setPollingInterval(interval);
+    
+    // Update large file reference for UI messaging
+    isLargeFileRef.current = fileSize > LARGE_FILE_THRESHOLD_MB;
+    
+    console.log(`Set polling interval to ${interval/1000}s for file size ${fileSize.toFixed(2)} MB`);
+  }, [fileSize]);
   
   const recordingDetailsViewApi = useQuery({
     queryKey: ["meetingView", eventId],
@@ -401,17 +488,20 @@ export default function RecordingScreen() {
           
           await saveRecording(data, eventID, date);
           
-          const finalStatus = data.trascription_status === "success" ? 'completed' : 'failed';
+          // Only mark as completed if transcription is successful AND summary is available
+          const finalStatus = data.trascription_status === "success" && data.summary ? 'completed' : 
+                             data.trascription_status === "success" && !data.summary ? 'processing' : 'failed';
           updateRecordingStatusInCache(eventID, finalStatus);
           
           if (data.trascription_status === "success") {
             Toast.show("Recording processed successfully!", Toast.SHORT, "top", "success");
+            
+            // Only redirect when processing is complete and we have a summary
+            if (data.summary && pathname && pathname.includes('recording') && !pathname.includes('recordinglist')) {
+              router.push(`/recordingview?eventID=${eventID}`);
+            }
           } else {
             Toast.show("Processing completed with issues. Check details.", Toast.SHORT, "top", "info");
-          }
-          
-          if (pathname && pathname.includes('recording') && !pathname.includes('recordinglist')) {
-            router.push(`/recordingview?eventID=${eventID}`);
           }
           
           setEventId("");
@@ -519,8 +609,23 @@ export default function RecordingScreen() {
     const attemptProcessing = () => {
       processingAttemptsRef.current += 1;
       
+      // Detect if this is a large file based on file path or title
       const isLargeFile = payload.file_path.includes('large') || 
                          (payload.meeting_title || '').toLowerCase().includes('large');
+      const isVeryLargeFile = (payload.meeting_title || '').toLowerCase().includes('large') && 
+                             (payload.meeting_title || '').match(/\d+MB/) && 
+                             parseInt((payload.meeting_title || '').match(/\d+MB/)?.[0] || '0') > 100;
+      
+      // Set appropriate polling interval based on file size
+      if (isVeryLargeFile) {
+        setPollingInterval(30000); // 30 seconds for very large files
+      } else if (isLargeFile) {
+        setPollingInterval(15000); // 15 seconds for large files
+      } else if (fileSize <= SMALL_FILE_THRESHOLD_MB) {
+        setPollingInterval(3000); // 3 seconds for small files (optimized processing)
+      } else {
+        setPollingInterval(5000); // 5 seconds for medium-sized files
+      }
       
       if (processingAttemptsRef.current === 1) {
         Toast.show(
@@ -535,8 +640,7 @@ export default function RecordingScreen() {
           Toast.SHORT,
           "top",
           "info"
-        );
-      }
+        );}
       
       console.log(`Processing attempt ${processingAttemptsRef.current}/${maxProcessingAttempts} for file: ${payload.file_path}`);
       
@@ -553,16 +657,54 @@ export default function RecordingScreen() {
             const currentDate = new Date().toISOString().replace("T", " ").slice(0, 19);
             addNewRecordingToCache(currentEventId, payload.meeting_title, currentDate);
             
-            Toast.show(
-              "Processing started successfully! You can monitor progress in your recordings.",
-              Toast.LONG,
-              "top",
-              "success"
-            );
-
-            setTimeout(() => {
-              router.push('/(tabs)/recordinglist');
-            }, 1000);
+            // Different handling based on file size
+            if (fileSize <= SMALL_FILE_THRESHOLD_MB) {
+              // For small files, show optimized processing message
+              Toast.show(
+                "Fast-track processing started! This should complete quickly.",
+                Toast.SHORT,
+                "top",
+                "success"
+              );
+              
+              // Set a shorter polling interval for small files
+              setPollingInterval(2000); // 2 seconds for very responsive updates
+              
+            } else if (isLargeFile) {
+              // For large files, show longer processing message
+              Toast.show(
+                "Processing started successfully! This may take several minutes.",
+                Toast.LONG,
+                "top",
+                "success"
+              );
+              
+              // For large files, give the option to go to recordings list
+              Alert.alert(
+                "Processing Started",
+                "Your recording is being processed. This may take several minutes. Would you like to stay on this screen or view your recordings list?",
+                [
+                  {
+                    text: "Stay Here",
+                    style: "cancel"
+                  },
+                  {
+                    text: "View Recordings",
+                    onPress: () => {
+                      router.push('/(tabs)/recordinglist');
+                    }
+                  }
+                ]
+              );
+            } else {
+              // For medium-sized files, just show a toast and stay on the screen
+              Toast.show(
+                "Processing started successfully! Please wait while we process your recording.",
+                Toast.LONG,
+                "top",
+                "success"
+              );
+            }
           } else {
             console.error('Processing failed with message:', e.message);
             Toast.show(e.message, Toast.SHORT, "top", "error");
@@ -636,6 +778,7 @@ export default function RecordingScreen() {
   };
 
   // Define file size thresholds for different handling
+  const SMALL_FILE_THRESHOLD_MB = 10; // Files under 10MB will use Buffer method
   const LARGE_FILE_THRESHOLD_MB = 50;
   const VERY_LARGE_FILE_THRESHOLD_MB = 100;
   
@@ -659,6 +802,11 @@ export default function RecordingScreen() {
       let isLargeFile = false;
       let isVeryLargeFile = false;
       
+      // Define these variables early with default values
+      let fileSize = '';
+      let fileType = '';
+      let filename = `audio-${date}.m4a`; // Default filename
+      
       // Check file size before uploading
       try {
         const fileInfo = await fetch(uri);
@@ -666,8 +814,19 @@ export default function RecordingScreen() {
         fileSizeInMB = blob.size / (1024 * 1024);
         console.log(`File size: ${fileSizeInMB.toFixed(2)} MB`);
         
+        // Update file size state for polling interval adjustment
+        setFileSize(fileSizeInMB);
+        
         isLargeFile = fileSizeInMB > LARGE_FILE_THRESHOLD_MB;
         isVeryLargeFile = fileSizeInMB > VERY_LARGE_FILE_THRESHOLD_MB;
+        const isSmallFile = fileSizeInMB <= SMALL_FILE_THRESHOLD_MB;
+        
+        // Update the variables declared earlier
+        fileSize = fileSizeInMB > 0 ? `_${fileSizeInMB.toFixed(0)}MB` : '';
+        fileType = isLargeFile ? '_large' : '';
+        filename = `audio-${date}${fileSize}${fileType}.m4a`;
+        
+        console.log(`File categorization - Small: ${isSmallFile}, Large: ${isLargeFile}, Very Large: ${isVeryLargeFile}`);
         
         if (isVeryLargeFile) {
           Toast.show(
@@ -683,17 +842,49 @@ export default function RecordingScreen() {
             "top",
             "info"
           );
+        } else if (isSmallFile) {
+          Toast.show(
+            `Small file detected (${fileSizeInMB.toFixed(2)} MB) - Using optimized processing`,
+            Toast.SHORT,
+            "top",
+            "info"
+          );
+          
+          try {
+            const uploadResult = await directUploadForSmallFiles(uri, filename);
+            
+            if (uploadResult.success) {
+              Toast.show("Small file uploaded successfully!", Toast.SHORT, "top", "success");
+              
+              // Process immediately for small files
+              Toast.show("Starting audio processing...", Toast.SHORT, "top", "info");
+              
+              handleProccessRecording({
+                file_url: uploadResult.fileUrl!,
+                file_path: uploadResult.filePath!,
+                meeting_title: `recording ${new Date().toISOString()} (fast-processed)`,
+              });
+              return;
+            }
+          } catch (directUploadError) {
+            console.log("Direct upload failed, falling back to standard method:", directUploadError);
+            Toast.show("Fast upload failed, trying standard upload...", Toast.SHORT, "top", "info");
+            // Continue with standard upload below
+          }
         }
       } catch (error) {
         console.log("Error checking file size:", error);
       }
-
-      const fileSize = fileSizeInMB > 0 ? `_${fileSizeInMB.toFixed(0)}MB` : '';
-      const fileType = isLargeFile ? '_large' : '';
-      const filename = `audio-${date}${fileSize}${fileType}.m4a`;
-
-      // For large files, try streaming upload first, then fallback to original method
-      if (isLargeFile) {
+      
+      // Filename is already defined in the try block above
+      
+      // For small files under 10MB, use buffer method for faster processing
+      const isSmallFile = fileSizeInMB > 0 && fileSizeInMB <= SMALL_FILE_THRESHOLD_MB;
+      
+      // Small file handling is now done in the file categorization section above
+       
+       // For large files, try streaming upload first, then fallback to original method
+       if (isLargeFile) {
         try {
           Toast.show("Starting streaming upload...", Toast.SHORT, "top", "info");
           const uploadResult = await streamingUploadToS3(uri, filename);
@@ -946,7 +1137,7 @@ export default function RecordingScreen() {
           <View className="bg-[#0F0F0F] rounded-xl p-12">
             <Text
               className="text-center text-xl text-white mb-4"
-              numberOfLines={1}
+              numberOfLines={2}
               ellipsizeMode="tail"
               adjustsFontSizeToFit
               minimumFontScale={0.8}
@@ -956,7 +1147,7 @@ export default function RecordingScreen() {
                 : proccessRecordingMutation.isPending
                 ? "Processing the audio file. please wait..."
                 : isFectingRecordingDetails
-                ? "Processing the audio file. please wait..."
+                ? "Processing your recording..."
                 : isStreamingUpload
                 ? "Streaming upload in progress..."
                 : uploadRecordToS3.isPending
@@ -964,8 +1155,37 @@ export default function RecordingScreen() {
                 : ""}
             </Text>
             
+            {isFectingRecordingDetails && (
+              <Text className="text-center text-sm text-gray-400 mb-4">
+                {pollingAttemptsRef.current > 0 ? 
+                  `Processing attempt ${pollingAttemptsRef.current}/${maxPollingAttempts}` : 
+                  "Starting processing..."}
+                {isLargeFileRef.current ? 
+                  "\nLarge files may take several minutes to process." : 
+                  fileSize <= SMALL_FILE_THRESHOLD_MB ?
+                  "\nSmall files are processed with optimized method for faster results." :
+                  "\nProcessing typically takes 1-2 minutes."}
+              </Text>
+            )}
+            
             {!(isStreamingUpload || uploadRecordToS3.isPending) && (
-              <ActivityIndicator size="large" color="#004aad" />
+              <ActivityIndicator 
+                size="large" 
+                color={isFectingRecordingDetails && fileSize <= SMALL_FILE_THRESHOLD_MB ? "#0a7ea4" : "#0a7ea4"} 
+              />
+            )}
+            
+            {isFectingRecordingDetails && (
+              <View className="mt-4">
+                <CustomButton
+                  onPress={() => router.push('/(tabs)/recordinglist')}
+                  title="View Recordings List"
+                  className="py-3 rounded-lg mt-2"
+                  style={{ 
+                    backgroundColor: fileSize <= SMALL_FILE_THRESHOLD_MB ? '#0a7ea4' : '#0a7ea4' 
+                  }}
+                />
+              </View>
             )}
           </View>
           
