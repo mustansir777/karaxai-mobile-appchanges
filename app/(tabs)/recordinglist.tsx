@@ -944,6 +944,16 @@ export default function RecordingList() {
               </TouchableOpacity>
             </View>
             
+            {/* MODIFIED: Sync Indicator - Now positioned between join meeting and recent meetings */}
+            {isSyncInProgress && (
+              <View style={styles.inlineSyncIndicatorContainer}>
+                <View style={styles.inlineSyncIndicatorContent}>
+                  <SyncingIndicator />
+                  <Text style={styles.inlineSyncIndicatorText}>Sync in progress</Text>
+                </View>
+              </View>
+            )}
+            
             {!viewAllMode ? (
               // Recent Meetings - Horizontal Slider
               <>
@@ -1002,12 +1012,6 @@ export default function RecordingList() {
             )}
           </ScrollView>
         )}
-        
-        {isSyncInProgress && (
-          <View style={styles.syncIndicator}>
-            <SyncingIndicator />
-          </View>
-        )}
       </ThemeView>
     </View>
   );
@@ -1058,6 +1062,31 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: '600',
+  },
+  // NEW: Inline sync indicator styles (positioned between join meeting and recent meetings)
+  inlineSyncIndicatorContainer: {
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  inlineSyncIndicatorContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0a7ea4',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+  },
+  inlineSyncIndicatorText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '500',
+    marginLeft: 8,
   },
   sectionHeader: {
     flexDirection: 'row',
@@ -1203,11 +1232,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
-  syncIndicator: {
-    position: 'absolute',
-    top: 20,
-    right: 20,
-  },
   deleteButton: {
     marginLeft: 12,
     padding: 4,
@@ -1310,4 +1334,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
+  // REMOVED: Old absolute positioned sync indicator styles
+  // syncIndicatorContainer, syncIndicatorContent, syncIndicatorText
 });
