@@ -87,7 +87,8 @@ export const UploadRecord: React.FC<UploadRecordProps> = ({ onUpload }) => {
         onPress={handleSelectAudioFile}
         title={isChecking ? "Checking file..." : "Upload Meeting Recording"}
         type="primary"
-        className="py-3 w-full rounded-lg"
+        className="py-3 w-full rounded-lg text-white"
+        style={{ backgroundColor: '#0a7ea4' }}
         icon={isChecking ? 
           <ActivityIndicator size="small" color="white" /> : 
           <Ionicons name="cloud-upload-outline" size={18} color="white" />}
