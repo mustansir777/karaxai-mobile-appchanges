@@ -1157,17 +1157,14 @@ export default function RecordingScreen() {
             
             {isFectingRecordingDetails && (
               <Text className="text-center text-sm text-gray-400 mb-4">
-                {pollingAttemptsRef.current > 0 ? 
-                  `Processing attempt ${pollingAttemptsRef.current}/${maxPollingAttempts}` : 
-                  "Starting processing..."}
-                {isLargeFileRef.current ? 
-                  "\nLarge files may take several minutes to process." : 
-                  fileSize <= SMALL_FILE_THRESHOLD_MB ?
-                  "\nSmall files are processed with optimized method for faster results." :
-                  "\nProcessing typically takes 1-2 minutes."}
+                Processing your recording...
+                {"\n"}
+                {isLargeFileRef.current && "Large files may take several minutes to process."}
+                {fileSize <= SMALL_FILE_THRESHOLD_MB && "\n"}
+                {!isLargeFileRef.current && "Processing typically takes 1-2 minutes."}
               </Text>
             )}
-            
+                        
             {!(isStreamingUpload || uploadRecordToS3.isPending) && (
               <ActivityIndicator 
                 size="large" 
@@ -1177,14 +1174,14 @@ export default function RecordingScreen() {
             
             {isFectingRecordingDetails && (
               <View className="mt-4">
-                <CustomButton
+                {/* <CustomButton
                   onPress={() => router.push('/(tabs)/recordinglist')}
                   title="View Recordings List"
                   className="py-3 rounded-lg mt-2"
                   style={{ 
                     backgroundColor: fileSize <= SMALL_FILE_THRESHOLD_MB ? '#0a7ea4' : '#0a7ea4' 
                   }}
-                />
+                /> */}
               </View>
             )}
           </View>
