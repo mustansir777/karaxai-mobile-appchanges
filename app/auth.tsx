@@ -229,7 +229,12 @@ export default function AuthScreen() {
 
   return (
     <ThemeView>
-      <ScrollView automaticallyAdjustKeyboardInsets={true} contentContainerClassName="flex-grow">
+      <ScrollView 
+        automaticallyAdjustKeyboardInsets={true} 
+        contentContainerClassName="flex-grow"
+        showsVerticalScrollIndicator={true}
+        showsHorizontalScrollIndicator={false}
+      >
         <View className="flex-1 items-start justify-end">
           <View className="h-1/4 flex-1 items-start justify-end mb-6 px-4">
             <View className="flex flex-col gap-8">
